@@ -2,10 +2,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Package visibility for Google Play services for LiteRT -->
+    <queries>
+        <package android:name="com.google.android.gms" />
+        <intent>
+            <action android:name="com.google.android.gms.ml.tflite.BIND_TASK_SERVICE" />
+        </intent>
+    </queries>
+
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
@@ -41,6 +50,10 @@
         android:theme="@style/Theme.MusicBike"
         tools:targetApi="31">
         
+        <meta-data
+            android:name="com.google.android.gms.tflite.dynamite.version"
+            android:value="@integer/google_play_services_version" />
+        
         <activity
             android:name="com.app.musicbike.ui.activities.MainActivity"
             android:exported="true">
@@ -63,7 +76,7 @@
             android:foregroundServiceType="mediaPlayback"/>
 
         <service
-            android:name=".InferenceService"
+            android:name=".services.InferenceService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 

@@ -26,7 +26,6 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
-import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 
 // For runtime permissions
 import android.Manifest
@@ -42,7 +41,18 @@ import android.net.Uri
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.documentfile.provider.DocumentFile
 import android.preference.PreferenceManager
-import java.io.OutputStream
+
+// For InferenceService integration
+import com.app.musicbike.services.InferenceService
+import android.content.ComponentName
+import android.content.Context
+import android.content.ServiceConnection
+import android.os.IBinder
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
+
+import android.os.Build
 
 class SensorsFragment : Fragment() {
 
@@ -52,6 +62,17 @@ class SensorsFragment : Fragment() {
 
     private var bleService: BleService? = null
     private var hasAttemptedObservationSetup = false
+
+    // InferenceService integration
+    private var inferenceService: InferenceService? = null
+    private var inferenceServiceBound = false
+    private val updateStatusHandler = Handler(Looper.getMainLooper())
+    private val statusUpdateRunnable = object : Runnable {
+        override fun run() {
+            updateInferenceStatus()
+            updateStatusHandler.postDelayed(this, 1000) // Update every second
+        }
+    }
 
     // Recording support
     private var isRecording = false
@@ -83,6 +104,50 @@ class SensorsFragment : Fragment() {
         } else {
             Log.w(TAG, "User cancelled directory selection")
             Snackbar.make(binding.root, "Directory selection cancelled", Snackbar.LENGTH_SHORT).show()
+        }
+    }
+
+    // InferenceService connection
+    private val inferenceServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            Log.d(TAG, "InferenceService connected")
+            val binder = service as? InferenceService.LocalBinder
+            if (binder != null) {
+                inferenceService = binder.getService()
+                inferenceServiceBound = true
+                updateInferenceUI()
+                startStatusUpdates()
+                
+                // Display class names after a short delay to allow model loading
+                mainHandler.postDelayed({
+                    if (isAdded && inferenceServiceBound) {
+                        displayAvailableClasses()
+                    }
+                }, 1000)
+            } else {
+                Log.e(TAG, "Failed to cast binder to InferenceService.LocalBinder")
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            Log.w(TAG, "InferenceService disconnected")
+            inferenceService = null
+            inferenceServiceBound = false
+            stopStatusUpdates()
+            updateInferenceUI()
+        }
+    }
+
+    // Broadcast receiver for inference results
+    private val inferenceResultReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == "com.app.musicbike.INFERENCE_RESULT") {
+                val result = intent.getStringExtra("result_data")
+                result?.let { 
+                    updateInferenceResult(it)
+                    Log.d(TAG, "Received inference result: $it")
+                }
+            }
         }
     }
 
@@ -173,13 +238,115 @@ class SensorsFragment : Fragment() {
             }
         }
 
+        // Inference trigger button
+        binding.btnTriggerInference.setOnClickListener {
+            inferenceService?.triggerInference()
+            Snackbar.make(binding.root, "Manual inference triggered", Snackbar.LENGTH_SHORT).show()
+        }
+
         // Try to hook up BLE
         if ((activity as? MainActivity)?.isBleServiceConnected == true) {
             onServiceReady()
         } else {
             binding.txtSensorData.text = "Waiting for connection..."
         }
+        
         setupFileList()
+        setupInferenceService()
+    }
+
+    private fun setupInferenceService() {
+        // Start and bind to InferenceService
+        val serviceIntent = Intent(requireContext(), InferenceService::class.java)
+        
+        // Use startForegroundService on Android 8.0+ (API 26+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            requireContext().startForegroundService(serviceIntent)
+        } else {
+            requireContext().startService(serviceIntent)
+        }
+        
+        requireContext().bindService(serviceIntent, inferenceServiceConnection, Context.BIND_AUTO_CREATE)
+        
+        // Register broadcast receiver for inference results
+        LocalBroadcastManager.getInstance(requireContext()).registerReceiver(
+            inferenceResultReceiver,
+            IntentFilter("com.app.musicbike.INFERENCE_RESULT")
+        )
+        
+        Log.d(TAG, "InferenceService setup initiated")
+    }
+
+    private fun updateInferenceUI() {
+        if (!isAdded) return
+        
+        val isModelReady = inferenceService?.isModelReady ?: false
+        binding.btnTriggerInference.isEnabled = isModelReady
+        
+        if (!inferenceServiceBound) {
+            binding.txtInferenceResult.text = "Service not connected"
+            binding.txtBufferStatus.text = "Service: Disconnected"
+            binding.txtAvailableClasses.text = "Service not connected"
+        } else if (!isModelReady) {
+            binding.txtInferenceResult.text = "Model not loaded"
+            binding.txtAvailableClasses.text = "Loading model..."
+        } else {
+            // Model is ready, show available class names
+            displayAvailableClasses()
+        }
+    }
+
+    private fun displayAvailableClasses() {
+        val classNames = inferenceService?.getClassNames()
+        if (classNames != null && classNames.isNotEmpty()) {
+            val classListText = "Detected Classes: ${classNames.joinToString(", ")}"
+            Log.d(TAG, classListText)
+            
+            // Display the class names in the UI
+            binding.txtAvailableClasses.text = classListText
+            
+            if (binding.txtInferenceResult.text.toString() == "Model not loaded") {
+                binding.txtInferenceResult.text = "Model ready - ${classNames.size} classes detected"
+            }
+        } else {
+            Log.d(TAG, "No class names available, using default class indices")
+            binding.txtAvailableClasses.text = "Class names not available - using indices"
+        }
+    }
+
+    private fun updateInferenceResult(result: String) {
+        if (!isAdded) return
+        binding.txtInferenceResult.text = result
+    }
+
+    private fun updateInferenceStatus() {
+        if (!isAdded || !inferenceServiceBound) return
+        
+        val status = inferenceService?.getBufferStatus() ?: "Service unavailable"
+        binding.txtBufferStatus.text = status
+        
+        // Update button state based on model readiness
+        val isModelReady = inferenceService?.isModelReady ?: false
+        binding.btnTriggerInference.isEnabled = isModelReady
+    }
+
+    private fun startStatusUpdates() {
+        updateStatusHandler.post(statusUpdateRunnable)
+    }
+
+    private fun stopStatusUpdates() {
+        updateStatusHandler.removeCallbacks(statusUpdateRunnable)
+    }
+
+    private fun addSensorDataToInference() {
+        if (!inferenceServiceBound) return
+        
+        val pitchVal = bleService?.pitch?.value ?: 0.0f
+        val rollVal = bleService?.roll?.value ?: 0.0f
+        val yawVal = bleService?.yaw?.value ?: 0.0f
+        val gForceVal = bleService?.gForce?.value ?: 0.0f
+        
+        inferenceService?.addSensorData(pitchVal, rollVal, yawVal, gForceVal)
     }
 
     private fun initiateRecordingSequence(filename: String) {
@@ -413,6 +580,27 @@ class SensorsFragment : Fragment() {
         }
     }
 
+    fun onBleServiceReady(service: BleService?) {
+        Log.d(TAG, "BleService ready notification received")
+        bleService = service
+        if (bleService != null && !hasAttemptedObservationSetup) {
+            observeSensorData()
+            hasAttemptedObservationSetup = true
+        } else if (bleService == null) {
+            binding.txtSensorData.text = "Error getting BLE service"
+        }
+    }
+
+    fun onInferenceServiceReady(service: InferenceService?) {
+        Log.d(TAG, "InferenceService ready notification received")
+        inferenceService = service
+        inferenceServiceBound = service != null
+        updateInferenceUI()
+        if (inferenceServiceBound) {
+            startStatusUpdates()
+        }
+    }
+
     private fun observeSensorData() {
         bleService?.apply {
             speed.observe(viewLifecycleOwner) { updateSensorDisplay() }
@@ -463,6 +651,12 @@ class SensorsFragment : Fragment() {
             lastEventVal
         )
         binding.txtSensorData.text = displayText
+        
+        // Send sensor data to InferenceService for real-time processing
+        if (inferenceServiceBound) {
+            inferenceService?.addSensorData(pitchVal, rollVal, yawVal, gForceVal)
+        }
+        
         // If recording is active, capture this data
         if (isRecording) {
             // Example: record all relevant values, comma-separated
@@ -763,10 +957,30 @@ class SensorsFragment : Fragment() {
             // Update display with current values if service was already connected
             updateSensorDisplay()
         }
+        
+        // Check InferenceService connection
+        if (inferenceService == null && (activity as? MainActivity)?.isInferenceServiceConnected == true) {
+            val mainActivity = activity as? MainActivity
+            onInferenceServiceReady(mainActivity?.getInferenceServiceInstance())
+        }
     }
 
     override fun onDestroyView() {
         super.onDestroyView()
+        
+        // Clean up InferenceService
+        stopStatusUpdates()
+        if (inferenceServiceBound) {
+            requireContext().unbindService(inferenceServiceConnection)
+            inferenceServiceBound = false
+        }
+        try {
+            LocalBroadcastManager.getInstance(requireContext()).unregisterReceiver(inferenceResultReceiver)
+        } catch (e: Exception) {
+            Log.w(TAG, "Error unregistering inference result receiver", e)
+        }
+        inferenceService = null
+        
         _binding = null // Crucial to avoid memory leaks
         hasAttemptedObservationSetup = false
         mainHandler.removeCallbacksAndMessages(null) // Stop any pending recording stops

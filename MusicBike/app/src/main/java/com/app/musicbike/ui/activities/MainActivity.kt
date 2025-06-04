@@ -9,8 +9,6 @@ import android.content.pm.PackageManager // ADDED for PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import android.widget.Toast // ADDED for Toast
 import androidx.activity.result.contract.ActivityResultContracts // ADDED for permission launcher
@@ -26,9 +24,11 @@ import com.app.musicbike.R
 import com.app.musicbike.databinding.ActivityMainBinding
 import com.app.musicbike.services.BleService
 import com.app.musicbike.services.MusicService
+import com.app.musicbike.services.InferenceService
 import com.app.musicbike.ui.adapter.ViewPagerAdapter
 import com.app.musicbike.ui.fragments.DevicesFragment
 import com.app.musicbike.ui.fragments.MusicFragment
+import com.app.musicbike.ui.fragments.SensorsFragment
 import com.google.android.material.tabs.TabLayout
 import com.google.android.material.tabs.TabLayoutMediator
 import kotlinx.coroutines.Dispatchers
@@ -48,6 +48,11 @@ class MainActivity : AppCompatActivity() {
     private var musicServiceBound = false
     private var musicService: MusicService? = null
     var isMusicServiceConnected = false
+        private set
+
+    private var inferenceServiceBound = false
+    private var inferenceService: InferenceService? = null
+    var isInferenceServiceConnected = false
         private set
 
     // --- ADDED: Permission Launcher for POST_NOTIFICATIONS ---
@@ -106,6 +111,7 @@ class MainActivity : AppCompatActivity() {
                 Log.d(TAG, "BleService connected variable set: $isBleServiceConnected")
                 notifyDevicesFragmentBleServiceReady()
                 notifyMusicFragmentBleServiceReady() // For BleService to MusicFragment
+                notifySensorsFragmentBleServiceReady() // For BleService to SensorsFragment
             } else {
                 Log.e(TAG, "Failed to cast binder to BleService.LocalBinder")
                 isBleServiceConnected = false
@@ -162,6 +168,30 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val inferenceServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            Log.d(TAG, "onServiceConnected: InferenceService connection established.")
+            val binder = service as? InferenceService.LocalBinder
+            if (binder != null) {
+                inferenceService = binder.getService()
+                inferenceServiceBound = true
+                isInferenceServiceConnected = true
+                Log.d(TAG, "InferenceService connected variable set: $isInferenceServiceConnected")
+                notifySensorsFragmentInferenceServiceReady()
+            } else {
+                Log.e(TAG, "Failed to cast binder to InferenceService.LocalBinder")
+                isInferenceServiceConnected = false
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            Log.w(TAG, "onServiceDisconnected: InferenceService connection lost.")
+            inferenceService = null
+            inferenceServiceBound = false
+            isInferenceServiceConnected = false
+        }
+    }
+
     // FMOD JNI has been moved to MusicService.
     // The companion object for loading libraries is also in MusicService now.
     // The external fun declarations are also in MusicService.
@@ -212,6 +242,9 @@ class MainActivity : AppCompatActivity() {
 
         Log.d(TAG, "onCreate: Starting and binding to MusicService...")
         startAndBindMusicService()
+
+        Log.d(TAG, "onCreate: Starting and binding to InferenceService...")
+        startAndBindInferenceService()
 
         // FMOD org.fmod.FMOD.init() and initial FMOD calls are now handled by MusicService
     }
@@ -278,12 +311,26 @@ class MainActivity : AppCompatActivity() {
         bindService(serviceIntent, musicServiceConnection, Context.BIND_AUTO_CREATE)
     }
 
+    private fun startAndBindInferenceService() {
+        val serviceIntent = Intent(this, InferenceService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ContextCompat.startForegroundService(this, serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+        bindService(serviceIntent, inferenceServiceConnection, Context.BIND_AUTO_CREATE)
+    }
+
     fun getBleServiceInstance(): BleService? {
         return if (bleServiceBound) bleService else null
     }
 
     fun getMusicServiceInstance(): MusicService? {
         return if (musicServiceBound) musicService else null
+    }
+
+    fun getInferenceServiceInstance(): InferenceService? {
+        return if (inferenceServiceBound) inferenceService else null
     }
 
     private fun notifyDevicesFragmentBleServiceReady() {
@@ -313,6 +360,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun notifySensorsFragmentInferenceServiceReady() {
+        val fragment = supportFragmentManager.findFragmentByTag("f1") // SensorsFragment is at position 1
+        if (fragment is SensorsFragment) {
+            fragment.onInferenceServiceReady(inferenceService)
+        } else {
+            Log.w(TAG, "notifySensorsFragmentInferenceServiceReady: Could not find SensorsFragment (f1). It might not be created yet.")
+        }
+    }
+
+    private fun notifySensorsFragmentBleServiceReady() {
+        val fragment = supportFragmentManager.findFragmentByTag("f1") // SensorsFragment is at position 1
+        if (fragment is SensorsFragment) {
+            fragment.onBleServiceReady(bleService)
+        } else {
+            Log.w(TAG, "notifySensorsFragmentBleServiceReady: Could not find SensorsFragment (f1). It might not be created yet.")
+        }
+    }
+
     private fun setupViewPager() {
         val adapter = ViewPagerAdapter(supportFragmentManager, lifecycle)
         val viewPager: ViewPager2 = binding.viewPager
@@ -339,6 +404,11 @@ class MainActivity : AppCompatActivity() {
             unbindService(musicServiceConnection)
             musicServiceBound = false // Reset flag
             isMusicServiceConnected = false
+        }
+        if (inferenceServiceBound) {
+            unbindService(inferenceServiceConnection)
+            inferenceServiceBound = false // Reset flag
+            isInferenceServiceConnected = false
         }
         Log.d(TAG, "MainActivity onDestroy completed.")
         // FMOD.close() is handled by MusicService

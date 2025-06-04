@@ -21,7 +21,6 @@ import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.Observer
 import com.app.musicbike.R // Make sure R is imported correctly
-import com.app.musicbike.InferenceService // Added import
 
 class MusicService : Service() {
 

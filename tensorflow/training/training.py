@@ -3,8 +3,13 @@ import numpy as np
 import os
 import glob
 from sklearn.model_selection import train_test_split
+from tflite_support import flatbuffers
+from tflite_support import metadata as _metadata
+from tflite_support import metadata_schema_py_generated as _metadata_fb
+from tflite_support.metadata_writers import metadata_info
+from tflite_support.metadata_writers import writer_utils
 
-TIMESTEPS = 220  # 2 seconds at 50Hz
+TIMESTEPS = 220  # 10 seconds at 50Hz
 NUM_FEATURES = 4  # pitch, roll, yaw, gForce
 NUM_CLASSES = 3
 BATCH_SIZE = 32
@@ -96,8 +101,14 @@ def load_real_data(timesteps=150):
     if len(unique_labels) != 3:
         raise ValueError(f"Exactly 3 classes required. Found: {unique_labels}")
     label_map = {label: idx for idx, label in enumerate(unique_labels)}
+    print(f"Class labels: {unique_labels}")
     
-    return np.array(X, dtype=np.float32), np.array([label_map[label] for label in y])
+    # Save labels to file for metadata
+    with open('trick_labels.txt', 'w') as f:
+        for label in unique_labels:
+            f.write(f"{label}\n")
+    
+    return np.array(X, dtype=np.float32), np.array([label_map[label] for label in y]), unique_labels
 
 def augment_imu_data(X, y, augmentation_factor=8):
     """
@@ -174,32 +185,40 @@ def augment_imu_data(X, y, augmentation_factor=8):
 
 def create_compatible_imu_model(input_shape, num_classes):
     """
-    TFLite-compatible CNN+LSTM model using older operations.
-    Uses custom Dense layers and simplified architecture.
+    TFLite-compatible CNN model using only standard builtin operations.
+    Replaces LSTM with CNN layers for better TFLite compatibility.
     """    
     inputs = tf.keras.layers.Input(shape=input_shape)
     
-    # Simple multi-scale feature extraction
+    # Multi-scale feature extraction
     x1 = tf.keras.layers.Conv1D(16, 3, activation='relu', padding='same')(inputs)
     x2 = tf.keras.layers.Conv1D(16, 7, activation='relu', padding='same')(inputs)
+    x3 = tf.keras.layers.Conv1D(16, 11, activation='relu', padding='same')(inputs)
     
     # Combine features
-    x = tf.keras.layers.Concatenate()([x1, x2])  # 32 features
+    x = tf.keras.layers.Concatenate()([x1, x2, x3])  # 48 features
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.MaxPooling1D(2)(x)  # Reduce from 220 to 110
     
     # Second convolution layer
-    x = tf.keras.layers.Conv1D(32, 5, activation='relu', padding='same')(x)
+    x = tf.keras.layers.Conv1D(64, 5, activation='relu', padding='same')(x)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.MaxPooling1D(2)(x)  # Reduce from 110 to 55
     
-    # Simple LSTM for temporal patterns
-    x = tf.keras.layers.LSTM(32, dropout=0.3, recurrent_dropout=0.3)(x)
+    # Third convolution layer for temporal patterns (replaces LSTM)
+    x = tf.keras.layers.Conv1D(32, 3, activation='relu', padding='same')(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.MaxPooling1D(2)(x)  # Reduce from 55 to 27
+    
+    # Global pooling to aggregate temporal information
+    x = tf.keras.layers.GlobalAveragePooling1D()(x)
     
     # Classification layers
-    x = CompatibleDense(32, activation='relu')(x)
+    x = tf.keras.layers.Dense(64, activation='relu')(x)
     x = tf.keras.layers.Dropout(0.5)(x)
-    outputs = CompatibleDense(num_classes, activation='softmax')(x)
+    x = tf.keras.layers.Dense(32, activation='relu')(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+    outputs = tf.keras.layers.Dense(num_classes, activation='softmax')(x)
     
     model = tf.keras.Model(inputs=inputs, outputs=outputs, name='simple_trick_detector')
     
@@ -212,66 +231,180 @@ def create_compatible_imu_model(input_shape, num_classes):
     
     return model
 
+def add_comprehensive_metadata(model_path, output_path, labels_file, class_names):
+    """
+    Add comprehensive metadata including quantization parameters and class information.
+    """
+    # Load the model to get quantization parameters
+    interpreter = tf.lite.Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+    
+    input_details = interpreter.get_input_details()[0]
+    output_details = interpreter.get_output_details()[0]
+    
+    # Create model metadata
+    model_meta = _metadata_fb.ModelMetadataT()
+    model_meta.name = "Bike Trick Detector"
+    model_meta.description = ("IMU-based bike trick classification model. "
+                             "Detects bike tricks from pitch, roll, yaw, and gForce sensor data.")
+    model_meta.version = "v1.0.0"
+    model_meta.author = "Music Bike Team"
+    
+    # Input metadata with quantization parameters
+    input_meta = _metadata_fb.TensorMetadataT()
+    input_meta.name = "imu_sequence"
+    input_meta.description = (
+        f"Input IMU sequence with {TIMESTEPS} timesteps and {NUM_FEATURES} features. "
+        "Features are: [pitch, roll, yaw, gForce]. Expected data range varies by sensor."
+    )
+    
+    # Add quantization parameters for input if quantized
+    if input_details['dtype'] == np.uint8 or input_details['dtype'] == np.int8:
+        input_quantization = input_details['quantization_parameters']
+        if input_quantization['scales'].size > 0:
+            # Input quantization metadata
+            input_quant_meta = _metadata_fb.QuantizationParametersT()
+            input_quant_meta.scale = input_quantization['scales'].tolist()
+            input_quant_meta.zeroPoint = input_quantization['zero_points'].tolist()
+            input_meta.quantization = input_quant_meta
+            
+            print(f"Input quantization - Scale: {input_quantization['scales']}, "
+                  f"Zero Point: {input_quantization['zero_points']}")
+    
+    # Input statistics
+    input_stats = _metadata_fb.StatsT()
+    input_stats.max = [180.0, 180.0, 180.0, 10.0]  # Max expected values for pitch, roll, yaw, gForce
+    input_stats.min = [-180.0, -180.0, -180.0, -10.0]  # Min expected values
+    input_meta.stats = input_stats
+    
+    # Output metadata with quantization parameters
+    output_meta = _metadata_fb.TensorMetadataT()
+    output_meta.name = "trick_probabilities"
+    output_meta.description = f"Probability distribution over {NUM_CLASSES} bike trick classes."
+    
+    # Add quantization parameters for output if quantized
+    if output_details['dtype'] == np.uint8 or output_details['dtype'] == np.int8:
+        output_quantization = output_details['quantization_parameters']
+        if output_quantization['scales'].size > 0:
+            # Output quantization metadata
+            output_quant_meta = _metadata_fb.QuantizationParametersT()
+            output_quant_meta.scale = output_quantization['scales'].tolist()
+            output_quant_meta.zeroPoint = output_quantization['zero_points'].tolist()
+            output_meta.quantization = output_quant_meta
+            
+            print(f"Output quantization - Scale: {output_quantization['scales']}, "
+                  f"Zero Point: {output_quantization['zero_points']}")
+    
+    # Output statistics
+    output_stats = _metadata_fb.StatsT()
+    output_stats.max = [1.0]
+    output_stats.min = [0.0]
+    output_meta.stats = output_stats
+    
+    # Associate label file with output
+    label_file = _metadata_fb.AssociatedFileT()
+    label_file.name = os.path.basename(labels_file)
+    label_file.description = f"Labels for {NUM_CLASSES} bike trick classes: {', '.join(class_names)}"
+    label_file.type = _metadata_fb.AssociatedFileType.TENSOR_AXIS_LABELS
+    output_meta.associatedFiles = [label_file]
+    
+    # Create subgraph metadata
+    subgraph = _metadata_fb.SubGraphMetadataT()
+    subgraph.inputTensorMetadata = [input_meta]
+    subgraph.outputTensorMetadata = [output_meta]
+    model_meta.subgraphMetadata = [subgraph]
+    
+    # Build and populate metadata
+    b = flatbuffers.Builder(0)
+    b.Finish(
+        model_meta.Pack(b),
+        _metadata.MetadataPopulator.METADATA_FILE_IDENTIFIER)
+    metadata_buf = b.Output()
+    
+    # Create populator and add metadata
+    populator = _metadata.MetadataPopulator.with_model_file(model_path)
+    populator.load_metadata_buffer(metadata_buf)
+    populator.load_associated_files([labels_file])
+    populator.populate()
+    
+    # Save the model with metadata
+    with open(output_path, 'wb') as f:
+        f.write(populator.get_model_buffer())
+    
+    print(f"✓ Metadata added successfully to {output_path}")
+    return True
+
 def convert_to_compatible_tflite(model, model_name='compatible_model'):
     """
-    Convert model to TFLite with maximum compatibility settings.
+    Convert model to TFLite with only builtin operations for maximum compatibility.
     """
-    # Method 1: Standard conversion with compatibility flags
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
     
-    # Use older operation set for maximum compatibility
-    converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS,
-        tf.lite.OpsSet.SELECT_TF_OPS  # Allow select TF ops as fallback
-    ]
+    # Use ONLY builtin operations - no SELECT_TF_OPS
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
     
-    # Disable experimental features that might cause compatibility issues
-    converter.allow_custom_ops = True
+    # Disable custom ops to force builtin-only conversion
+    converter.allow_custom_ops = False
     
     try:
         tflite_model = converter.convert()
         with open(f'{model_name}.tflite', 'wb') as f:
             f.write(tflite_model)
-        print(f"✓ Standard model saved as {model_name}.tflite")
+        print(f"✓ Builtin-only model saved as {model_name}.tflite")
         return True
     except Exception as e:
-        print(f"✗ Standard conversion failed: {e}")
+        print(f"✗ Builtin-only conversion failed: {e}")
         return False
 
-def convert_with_quantization(model, model_name='compatible_model_quant'):
+def convert_with_quantization(model, model_name='compatible_model_quant', X_train=None):
     """
-    Convert with quantization for better compatibility and smaller size.
+    Convert with quantization using only builtin operations and representative dataset.
     """
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
     
     # Enable quantization
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     
-    # Use conservative settings
-    converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
-        tf.lite.OpsSet.TFLITE_BUILTINS,
-        tf.lite.OpsSet.SELECT_TF_OPS
-    ]
+    # Use ONLY builtin operations
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
     
-    converter.allow_custom_ops = True
+    # Disable custom ops to force builtin-only conversion
+    converter.allow_custom_ops = False
+    
+    # Provide representative dataset for quantization
+    if X_train is not None:
+        def representative_dataset():
+            # Use a subset of training data as representative dataset
+            sample_size = min(100, len(X_train))
+            indices = np.random.choice(len(X_train), sample_size, replace=False)
+            for i in indices:
+                # Convert to float32 and add batch dimension
+                yield [X_train[i:i+1].astype(np.float32)]
+        
+        converter.representative_dataset = representative_dataset
+        
+        # Set inference input/output types to int8 for full integer quantization
+        converter.target_spec.supported_types = [tf.int8]
+        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
     
     try:
         quantized_model = converter.convert()
         with open(f'{model_name}.tflite', 'wb') as f:
             f.write(quantized_model)
-        print(f"✓ Quantized model saved as {model_name}.tflite")
+        print(f"✓ Quantized builtin-only model saved as {model_name}.tflite")
         return True
     except Exception as e:
-        print(f"✗ Quantized conversion failed: {e}")
+        print(f"✗ Quantized builtin-only conversion failed: {e}")
         return False
 
 # Main execution
 if __name__ == "__main__":
     # Load and augment data
     print("Loading original data...")
-    X_original, y_original = load_real_data(TIMESTEPS)
+    X_original, y_original, class_names = load_real_data(TIMESTEPS)
     print(f"Original data: {len(X_original)} samples")
+    print(f"Classes: {class_names}")
 
     print("Augmenting data...")
     X_augmented, y_augmented = augment_imu_data(X_original, y_original, augmentation_factor=8)
@@ -328,18 +461,47 @@ if __name__ == "__main__":
     # Try standard conversion
     success1 = convert_to_compatible_tflite(model, 'trick_detector_compatible')
 
-    # Try quantized conversion
-    success2 = convert_with_quantization(model, 'trick_detector_compatible_quant')
+    # Try quantized conversion with representative dataset
+    success2 = convert_with_quantization(model, 'trick_detector_compatible_quant', X_train)
+
+    # Add metadata to models
+    print("\nAdding comprehensive metadata...")
+    labels_file = 'trick_labels.txt'
+    
+    if success1:
+        try:
+            add_comprehensive_metadata(
+                'trick_detector_compatible.tflite',
+                'trick_detector_compatible_with_metadata.tflite',
+                labels_file,
+                class_names
+            )
+        except Exception as e:
+            print(f"✗ Failed to add metadata to float model: {e}")
+    
+    if success2:
+        try:
+            add_comprehensive_metadata(
+                'trick_detector_compatible_quant.tflite',
+                'trick_detector_compatible_quant_with_metadata.tflite',
+                labels_file,
+                class_names
+            )
+        except Exception as e:
+            print(f"✗ Failed to add metadata to quantized model: {e}")
 
     if success1 or success2:
-        print("\n✓ At least one compatible model was created successfully!")
+        print("\n✓ Models created successfully!")
         print("\nFiles created:")
         if success1:
             print("- trick_detector_compatible.tflite (FP32, compatible)")
+            print("- trick_detector_compatible_with_metadata.tflite (FP32, with metadata)")
         if success2:
             print("- trick_detector_compatible_quant.tflite (INT8, compatible)")
+            print("- trick_detector_compatible_quant_with_metadata.tflite (INT8, with metadata)")
+        print("- trick_labels.txt (class labels)")
         
-        print(f"\nPlace the .tflite file in: app/src/main/assets/")
-        print("Update TFLITE_MODEL_FILENAME in InferenceService.kt to match your chosen file.")
+        print(f"\nPlace the .tflite file and labels.txt in: app/src/main/assets/")
+        print("Use the *_with_metadata.tflite versions for automatic quantization handling in Android.")
     else:
         print("\n✗ All conversion attempts failed. The model may need further simplification.")

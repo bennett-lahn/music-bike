@@ -59,6 +59,11 @@ dependencies {
     implementation(libs.androidx.activity)
     implementation(libs.androidx.constraintlayout)
     implementation(files("libs/fmod.jar"))
+    
+    // LocalBroadcastManager for result broadcasting
+    implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
+    implementation(libs.litert.metadata)
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
@@ -69,8 +74,10 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.fragment.ktx) // Provides viewModels delegate
     implementation(libs.androidx.swiperefreshlayout) // Used for ML file refresh
-    implementation("org.tensorflow:tensorflow-lite:2.16.1") // Updated to latest stable version
-    implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1") // Updated to latest stable version
-    implementation("org.tensorflow:tensorflow-lite-support:0.4.4") // Updated to latest stable version
-    implementation("org.tensorflow:tensorflow-lite-select-tf-ops:2.16.1") // Additional TF operations
+
+    // Google Play services TensorFlow Lite dependencies (using version catalog)
+    implementation(libs.play.services.tflite.java)
+    // Optional: include TensorFlow Lite Support Library
+    implementation(libs.play.services.tflite.support)
+
 }
