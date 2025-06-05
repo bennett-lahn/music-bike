@@ -66,7 +66,7 @@ class InferenceService : Service() {
     private val NOTIFICATION_CHANNEL_ID = "inference_service_channel"
     private val NOTIFICATION_ID = 1
     private val CHANNEL_NAME = "ML Inference Service"
-    private val BUFFER_SIZE = 220
+    private val BUFFER_SIZE = 800
     private val INFERENCE_TRIGGER_COUNT = 100
     private val sensorBuffer = ArrayList<SensorReading>(BUFFER_SIZE)
     private var writeCount = 0
@@ -161,8 +161,6 @@ class InferenceService : Service() {
                 serviceHandler?.obtainMessage(MSG_RUN_INFERENCE)?.sendToTarget()
             } else if (modelSeqLen <= 0 && writeCount % INFERENCE_TRIGGER_COUNT == 0) {
                 Log.d(TAG, "Triggering inference after $writeCount writes, but model input shape not ready yet.")
-            } else {
-                // Do nothing
             }
         }
     }
