@@ -66,7 +66,7 @@ class InferenceService : Service() {
     private val NOTIFICATION_CHANNEL_ID = "inference_service_channel"
     private val NOTIFICATION_ID = 1
     private val CHANNEL_NAME = "ML Inference Service"
-    private val BUFFER_SIZE = 310
+    private val BUFFER_SIZE = 800
     private val INFERENCE_TRIGGER_COUNT = 100
     private val sensorBuffer = ArrayList<SensorReading>(BUFFER_SIZE)
     private var writeCount = 0
@@ -368,6 +368,15 @@ class InferenceService : Service() {
         val className = getClassName(maxIndex)
         val confidencePercent = (confidence * 100).coerceIn(0f, 100f)
         sendResultToClient("Prediction: $className (${confidencePercent.toInt()}%), Time: ${inferenceTime}ms")
+        
+        // Clear buffer if a trick is detected (i.e., not 'NoJpOr180t10n')
+        if (className != "NoJpOr180t10n") {
+            bufferLock.withLock {
+                sensorBuffer.clear()
+                writeCount = 0
+                Log.d(TAG, "Buffer cleared after detecting trick: $className")
+            }
+        }
     }
 
     private fun sendResultToClient(result: String) {
