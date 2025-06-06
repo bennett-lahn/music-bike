@@ -9,7 +9,11 @@ from tflite_support import metadata_schema_py_generated as _metadata_fb
 from tflite_support.metadata_writers import metadata_info
 from tflite_support.metadata_writers import writer_utils
 
-TIMESTEPS = 220  # 10 seconds at 50Hz
+# To use this file make sure to run it in python 3.11, only using tflite_support_nightly at the latest version and
+# with all other dependencies required that are compatible with that package. tflite_support_nightly is needed to add
+# the metadata to the model that gets read by the app, but is not supported anymore.
+
+TIMESTEPS = 310  # 10 seconds at 50Hz
 NUM_FEATURES = 4  # pitch, roll, yaw, gForce
 NUM_CLASSES = 3
 BATCH_SIZE = 32

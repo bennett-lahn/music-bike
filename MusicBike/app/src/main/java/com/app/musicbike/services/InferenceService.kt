@@ -66,7 +66,7 @@ class InferenceService : Service() {
     private val NOTIFICATION_CHANNEL_ID = "inference_service_channel"
     private val NOTIFICATION_ID = 1
     private val CHANNEL_NAME = "ML Inference Service"
-    private val BUFFER_SIZE = 800
+    private val BUFFER_SIZE = 310
     private val INFERENCE_TRIGGER_COUNT = 100
     private val sensorBuffer = ArrayList<SensorReading>(BUFFER_SIZE)
     private var writeCount = 0
