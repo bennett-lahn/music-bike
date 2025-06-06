@@ -91,7 +91,7 @@ class SensorsFragment : Fragment() {
     // Storage Access Framework support
     private lateinit var sharedPrefs: SharedPreferences
     private var selectedDirectoryUri: Uri? = null
-    
+
     // Activity result launcher for selecting directory
     private val selectDirectoryLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -138,12 +138,36 @@ class SensorsFragment : Fragment() {
         }
     }
 
+//    private fun simulateFakeInferences() {
+//        val musicService = (activity as? MainActivity)?.getMusicServiceInstance()
+//        val musicViewModel = (activity as? MainActivity)?.musicViewModel
+//
+//        if (musicService == null || musicViewModel?.isEventAuto?.value != true) return
+//
+//        val handler = Handler(Looper.getMainLooper())
+//        val sequence = listOf(
+//            0f to 0L,
+//            1f to 5000L,
+//            0f to 10000L,
+//            3f to 15000L,
+//            0f to 20000L
+//        )
+//
+//        for ((value, delay) in sequence) {
+//            handler.postDelayed({
+//                musicService.setFmodParameter("Event", value)
+//                Log.d("TestBench", "Simulated Event value = $value")
+//            }, delay)
+//        }
+//    }
+
+
     // Broadcast receiver for inference results
     private val inferenceResultReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "com.app.musicbike.INFERENCE_RESULT") {
                 val result = intent.getStringExtra("result_data")
-                result?.let { 
+                result?.let {
                     updateInferenceResult(it)
                     Log.d(TAG, "Received inference result: $it")
 
@@ -158,16 +182,20 @@ class SensorsFragment : Fragment() {
                         else -> 0f
                     }
 
-                    // Send to MusicViewModel if Event auto mode is active
+                    // Only send if auto mode is on
+                    val musicService = (activity as? MainActivity)?.getMusicServiceInstance()
                     val musicViewModel = (activity as? MainActivity)?.musicViewModel
-                    if (musicViewModel?.isEventAuto?.value == true) {
-                        musicViewModel.setFmodParameter("Event", eventValue)
+                    if (musicService != null && musicViewModel?.isEventAuto?.value == true) {
+                        musicService.setFmodParameter("Event", eventValue)
                         Log.d(TAG, "Set FMOD Event parameter to $eventValue for class $className")
                     }
+                    // 🔧 Simulated test bench: pretend the bike is doing things
+                    // simulateFakeInferences()
                 }
             }
         }
     }
+
 
     private companion object {
         private const val REQUEST_WRITE_STORAGE_PERMISSION = 101
