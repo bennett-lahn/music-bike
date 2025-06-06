@@ -35,10 +35,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import androidx.activity.viewModels
 
 class MainActivity : AppCompatActivity() {
     private val TAG = "MainActivity"
     private lateinit var binding: ActivityMainBinding
+
+    val musicViewModel: com.app.musicbike.ui.viewmodels.MusicViewModel by viewModels()
 
     private var bleServiceBound = false
     private var bleService: BleService? = null

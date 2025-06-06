@@ -146,6 +146,24 @@ class SensorsFragment : Fragment() {
                 result?.let { 
                     updateInferenceResult(it)
                     Log.d(TAG, "Received inference result: $it")
+
+                    // Extract the class name from the result string
+                    val className = it.substringAfter("Prediction: ").substringBefore(" (")
+
+                    // Map to FMOD event value
+                    val eventValue = when (className) {
+                        "180t10n" -> 3f
+                        "HOPt10n" -> 1f
+                        "NoJpOr180t10n" -> 0f
+                        else -> 0f
+                    }
+
+                    // Send to MusicViewModel if Event auto mode is active
+                    val musicViewModel = (activity as? MainActivity)?.musicViewModel
+                    if (musicViewModel?.isEventAuto?.value == true) {
+                        musicViewModel.setFmodParameter("Event", eventValue)
+                        Log.d(TAG, "Set FMOD Event parameter to $eventValue for class $className")
+                    }
                 }
             }
         }
