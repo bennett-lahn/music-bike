@@ -36,14 +36,22 @@ class MusicFragment : Fragment() {
     private var isEventAutoUi = false
     private var isHallDirectionAutoUi = false
 
+    private var isReceiverRegistered = false
+
     private val inferenceReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            val prediction = intent?.getStringExtra("prediction") ?: return
-            Log.d(TAG, "Received inference broadcast: $prediction")
+            val result = intent?.getStringExtra("result_data") ?: return
+            Log.d(TAG, "Received inference result: $result")
 
             if (musicViewModel.isEventAuto.value == true) {
-                val eventValue = when (prediction.uppercase(Locale.US)) {
-                    "180" -> 3f
+                val prediction = result.substringAfter("Prediction: ")
+                    .substringBefore(" (")
+                    .uppercase(Locale.US)
+
+                val eventValue = when (prediction) {
+                    "180t10n" -> 3f
+                    "HOPt10n" -> 1f
+                    "NoJpOr180t10n" -> 0f
                     else -> 0f
                 }
                 musicViewModel.setFmodParameter("Event", eventValue)
@@ -54,19 +62,37 @@ class MusicFragment : Fragment() {
 
     override fun onResume() {
         super.onResume()
-        Log.d(TAG, "onResume: Registering inferenceReceiver")
-        androidx.localbroadcastmanager.content.LocalBroadcastManager
-            .getInstance(requireContext())
-            .registerReceiver(inferenceReceiver, android.content.IntentFilter("INFERENCE_RESULT"))
+        if (!isReceiverRegistered) {
+            try {
+                val filter = android.content.IntentFilter("com.app.musicbike.INFERENCE_RESULT")
+                androidx.localbroadcastmanager.content.LocalBroadcastManager
+                    .getInstance(requireContext())
+                    .registerReceiver(inferenceReceiver, filter)
+                isReceiverRegistered = true
+                Log.d(TAG, "Inference receiver registered")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to register inference receiver", e)
+            }
+        }
     }
+
+
 
     override fun onPause() {
         super.onPause()
-        Log.d(TAG, "onPause: Unregistering inferenceReceiver")
-        androidx.localbroadcastmanager.content.LocalBroadcastManager
-            .getInstance(requireContext())
-            .unregisterReceiver(inferenceReceiver)
+        if (isReceiverRegistered) {
+            try {
+                androidx.localbroadcastmanager.content.LocalBroadcastManager
+                    .getInstance(requireContext())
+                    .unregisterReceiver(inferenceReceiver)
+                isReceiverRegistered = false
+                Log.d(TAG, "Inference receiver unregistered")
+            } catch (e: Exception) {
+                Log.w(TAG, "Receiver unregistration failed (probably already unregistered)", e)
+            }
+        }
     }
+
 
     private fun isBleConnected(): Boolean {
         val mainActivity = activity as? MainActivity
