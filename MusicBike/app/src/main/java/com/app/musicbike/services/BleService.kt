@@ -796,6 +796,7 @@ class BleService : Service() {
                             val eventString = when(eventCode) {
                                 1 -> "JUMP"
                                 2 -> "DROP"
+                                3 -> "180"
                                 else -> null
                             }
                             eventString?.let { _lastEvent.postValue(it) }

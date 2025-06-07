@@ -48,6 +48,16 @@ float dropThreshold = 2.5;      // gForce check (> threshold spike for drop)
 #define DIRECTION_THRESHOLD 0.3 // For IMU-based direction
 #define IMU_DIRECTION_ACCEL_THRESHOLD 0.3 // Threshold for IMU-based direction change (+/- this value)
 
+// --- 180 Detection Constants ---
+#define GFORCE_ANOMALY_UPPER 2.37f
+#define GFORCE_ANOMALY_LOWER 0.60f
+#define GFORCE_ANOMALY_WINDOW_MS 1500
+#define YAW_RATE_THRESHOLD_MIN 90.0f // deg/s for spin detection
+#define SPIN_SCORE_THRESHOLD 0.8f
+#define SPIN_SCORE_DECAY_PER_SEC (1.0f / 3.0f) // Full decay over 3 seconds
+#define TOTAL_ROTATION_THRESHOLD 80.0f // Required degrees of rotation
+#define ROTATION_DECAY_FACTOR 0.99f
+
 // Physical constants
 #define WHEEL_DIAMETER_INCHES 26.0
 #define WHEEL_CIRCUMFERENCE_CM (WHEEL_DIAMETER_INCHES * 2.54 * 3.14159)
@@ -116,6 +126,7 @@ int hallSensorValue2 = HIGH;      // Current raw value 2
 // --- Processed/Event Data (Protected by eventDataMutex) ---
 bool jumpDetected = false;
 bool dropDetected = false;
+bool oneEightyDetected = false;
 bool imuDirectionForward = true;
 int imuSpeedState = 0; // 0=Stop/Slow, 1=Medium, 2=Fast
 
@@ -298,9 +309,9 @@ void imuTask(void *pvParameters) {
             accelX = local_ax;
             accelY = local_ay;
             accelZ = local_az;
-            gyroX = local_gx * 180.0f / PI;
-            gyroY = local_gy * 180.0f / PI;
-            gyroZ = local_gz * 180.0f / PI;
+            gyroX = local_gx;
+            gyroY = local_gy;
+            gyroZ = local_gz;
             xSemaphoreGive(imuDataMutex);
         }
 
@@ -496,13 +507,24 @@ void processingTask(void *pvParameters) {
     static bool lastButtonState = HIGH;
     static unsigned long lastDebounceTime = 0;
 
+    // --- 180 Detection State ---
+    static unsigned long lastGForceAnomalyTime = 0;
+    static float spinScore = 0.0f;
+    static float total_rotation = 0.0f;
+    static unsigned long lastOneEightyTime = 0;
+    static unsigned long lastProcessTime = 0;
+
 
     xLastWakeTime = xTaskGetTickCount();
 
     while (1) {
         unsigned long currentMillis = millis();
+        // Calculate a dynamic delta-time in seconds for more accurate integration
+        float dt_sec = (lastProcessTime > 0) ? (currentMillis - lastProcessTime) / 1000.0f : (30.0f / 1000.0f);
+        lastProcessTime = currentMillis;
+
         // --- Local copies of data needed ---
-        float local_accelX=0.0, local_accelY=0.0, local_accelZ=0.0, local_gForce=1.0;
+        float local_accelX=0.0, local_accelY=0.0, local_accelZ=0.0, local_gForce=1.0, local_gyroZ = 0.0;
         float local_pitch=0.0;
         // ** NEW: Local copies of thresholds for this cycle **
         float local_jumpThreshold = 0.5; // Default if mutex fails
@@ -515,6 +537,7 @@ void processingTask(void *pvParameters) {
             local_accelX = accelX; local_accelY = accelY; local_accelZ = accelZ;
             local_gForce = gForce;
             local_pitch = pitch;
+            local_gyroZ = gyroZ;
             xSemaphoreGive(imuDataMutex);
         } else {
             Serial.println("Warning: processingTask failed to get imuDataMutex!");
@@ -535,12 +558,14 @@ void processingTask(void *pvParameters) {
         // --- Local copies of event/state variables ---
         bool current_jump_state = false;
         bool current_drop_state = false;
+        bool current_oneEighty_state = false;
         bool current_imuDir = true;
         int current_imuState = 0;
 
         if (xSemaphoreTake(eventDataMutex, portMAX_DELAY) == pdTRUE) {
             current_jump_state = jumpDetected;
             current_drop_state = dropDetected;
+            current_oneEighty_state = oneEightyDetected;
             current_imuDir = imuDirectionForward;
             current_imuState = imuSpeedState;
             xSemaphoreGive(eventDataMutex);
@@ -551,6 +576,7 @@ void processingTask(void *pvParameters) {
         // --- Local flags/variables for this cycle's updates ---
         bool local_jumpDetected_this_cycle = current_jump_state;
         bool local_dropDetected_this_cycle = current_drop_state;
+        bool local_oneEightyDetected_this_cycle = current_oneEighty_state;
         bool local_imuDirectionForward = current_imuDir;
         int local_imuSpeedState = current_imuState;
 
@@ -581,6 +607,47 @@ void processingTask(void *pvParameters) {
         }
         if (current_drop_state && (currentMillis - lastDropTime > EVENT_DISPLAY_DURATION)) {
             local_dropDetected_this_cycle = false;
+        }
+
+
+        // --- 180 Detection Logic ---
+        // 1. Check for recent G-Force anomaly
+        if (local_gForce > GFORCE_ANOMALY_UPPER || local_gForce < GFORCE_ANOMALY_LOWER) {
+            lastGForceAnomalyTime = currentMillis;
+        }
+        bool recentGForceAnomaly = (currentMillis - lastGForceAnomalyTime) < GFORCE_ANOMALY_WINDOW_MS;
+
+        // 2. Calculate spin score and total rotation
+        if (fabs(local_gyroZ) > YAW_RATE_THRESHOLD_MIN) {
+            // We are in a spin, accumulate score and rotation
+            spinScore += (fabs(local_gyroZ) / YAW_RATE_THRESHOLD_MIN) * dt_sec;
+            total_rotation += local_gyroZ * dt_sec;
+        } else {
+            // Not spinning fast, decay score and rotation
+            spinScore -= SPIN_SCORE_DECAY_PER_SEC * dt_sec;
+            total_rotation *= ROTATION_DECAY_FACTOR;
+        }
+        
+        if (spinScore < 0) {
+            spinScore = 0;
+        }
+        // If spin score has fully decayed, reset rotation as well. This signifies the end of a potential maneuver.
+        if (spinScore == 0) {
+            total_rotation = 0;
+        }
+
+        // 3. Check for 180 event trigger
+        if (!current_oneEighty_state && spinScore >= SPIN_SCORE_THRESHOLD && recentGForceAnomaly && fabs(total_rotation) >= TOTAL_ROTATION_THRESHOLD) {
+            local_oneEightyDetected_this_cycle = true;
+            lastOneEightyTime = currentMillis;
+            spinScore = 0; // Reset score after detection
+            total_rotation = 0; // Reset rotation after detection
+            Serial.println(">>> 180 DETECTED! G-Anom, Spin, and Rotation Met");
+        }
+
+        // Event clearing logic
+        if (current_oneEighty_state && (currentMillis - lastOneEightyTime > EVENT_DISPLAY_DURATION)) {
+            local_oneEightyDetected_this_cycle = false;
         }
 
 
@@ -637,6 +704,7 @@ void processingTask(void *pvParameters) {
         if (xSemaphoreTake(eventDataMutex, portMAX_DELAY) == pdTRUE) {
             jumpDetected = local_jumpDetected_this_cycle;
             dropDetected = local_dropDetected_this_cycle;
+            oneEightyDetected = local_oneEightyDetected_this_cycle;
             imuDirectionForward = local_imuDirectionForward;
             imuSpeedState = local_imuSpeedState;
             xSemaphoreGive(eventDataMutex);
@@ -659,6 +727,7 @@ void bleTask(void *pvParameters) {
     // Static internal vars for state
     static bool prevJumpDetected = false;
     static bool prevDropDetected = false;
+    static bool prevOneEightyDetected = false;
 
     xLastWakeTime = xTaskGetTickCount();
 
@@ -674,14 +743,14 @@ void bleTask(void *pvParameters) {
             // --- Read required data ---
             float local_speed=0.0, local_pitch=0.0, local_roll=0.0, local_yaw=0.0, local_gForce=1.0;
             float local_pitchOffset=0.0, local_rollOffset=0.0, local_yawOffset=0.0;
-            bool local_jump=false, local_drop=false, local_imuDir=true, local_hallDir=true;
+            bool local_jump=false, local_drop=false, local_180=false, local_imuDir=true, local_hallDir=true;
             int local_imuState=0;
             // Note: Thresholds are not currently sent over BLE, but could be added if needed
 
              if (xSemaphoreTake(hallDataMutex, portMAX_DELAY) == pdTRUE) { local_speed = currentSpeed; local_hallDir = hallDirectionForward; xSemaphoreGive(hallDataMutex); } else { vTaskDelay(1); continue; }
              if (xSemaphoreTake(imuDataMutex, portMAX_DELAY) == pdTRUE) { local_pitch = pitch; local_roll = roll; local_yaw = yaw; local_gForce = gForce; xSemaphoreGive(imuDataMutex); } else { vTaskDelay(1); continue; }
              if (xSemaphoreTake(offsetMutex, portMAX_DELAY) == pdTRUE) { local_pitchOffset = pitchOffset; local_rollOffset = rollOffset; local_yawOffset = yawOffset; xSemaphoreGive(offsetMutex); } else { vTaskDelay(1); continue; }
-             if (xSemaphoreTake(eventDataMutex, portMAX_DELAY) == pdTRUE) { local_jump = jumpDetected; local_drop = dropDetected; local_imuDir = imuDirectionForward; local_imuState = imuSpeedState; xSemaphoreGive(eventDataMutex); } else { vTaskDelay(1); continue; }
+             if (xSemaphoreTake(eventDataMutex, portMAX_DELAY) == pdTRUE) { local_jump = jumpDetected; local_drop = dropDetected; local_180 = oneEightyDetected; local_imuDir = imuDirectionForward; local_imuState = imuSpeedState; xSemaphoreGive(eventDataMutex); } else { vTaskDelay(1); continue; }
 
             // --- Calculate Zeroed Values ---
             float zeroedPitch = local_pitch - local_pitchOffset;
@@ -704,6 +773,7 @@ void bleTask(void *pvParameters) {
             bool notifyEvent = false;
             if (local_jump && !prevJumpDetected) { eventCode = 1; notifyEvent = true; Serial.println("BLE Notify: JUMP (1)"); }
             else if (local_drop && !prevDropDetected) { eventCode = 2; notifyEvent = true; Serial.println("BLE Notify: DROP (2)"); }
+            else if (local_180 && !prevOneEightyDetected) { eventCode = 3; notifyEvent = true; Serial.println("BLE Notify: 180 (3)"); }
 
             if (notifyEvent && pEventCharacteristic) {
                 pEventCharacteristic->setValue(&eventCode, sizeof(eventCode));
@@ -711,6 +781,7 @@ void bleTask(void *pvParameters) {
             }
             prevJumpDetected = local_jump; // Use the static variable
             prevDropDetected = local_drop; // Use the static variable
+            prevOneEightyDetected = local_180;
 
             // Direction & State Notifications
             // ... (Remain the same) ...
@@ -721,6 +792,7 @@ void bleTask(void *pvParameters) {
         } else {
              prevJumpDetected = false; // Reset state if disconnected
              prevDropDetected = false;
+             prevOneEightyDetected = false;
         }
 
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -748,7 +820,7 @@ void displayTask(void *pvParameters) {
          // --- Read required data ---
          float local_speed=0.0, local_pitch=0.0, local_gForce=1.0; // Removed roll, yaw
          float local_pitchOffset=0.0; // Removed rollOffset, yawOffset
-         bool local_jump=false, local_drop=false, local_hallDir=true, isConnected=false;
+         bool local_jump=false, local_drop=false, local_180=false, local_hallDir=true, isConnected=false;
          // ** NEW: Read thresholds **
          float local_jumpThreshold = 0.0;
          float local_landingThreshold = 0.0;
@@ -759,7 +831,7 @@ void displayTask(void *pvParameters) {
          if (xSemaphoreTake(hallDataMutex, portMAX_DELAY) == pdTRUE) { local_speed = currentSpeed; local_hallDir = hallDirectionForward; xSemaphoreGive(hallDataMutex); } else { vTaskDelay(1); continue; }
          if (xSemaphoreTake(imuDataMutex, portMAX_DELAY) == pdTRUE) { local_pitch = pitch; local_gForce = gForce; /*Removed roll, yaw reads*/ xSemaphoreGive(imuDataMutex); } else { vTaskDelay(1); continue; }
          if (xSemaphoreTake(offsetMutex, portMAX_DELAY) == pdTRUE) { local_pitchOffset = pitchOffset; /*Removed roll, yaw offset reads*/ xSemaphoreGive(offsetMutex); } else { vTaskDelay(1); continue; }
-         if (xSemaphoreTake(eventDataMutex, portMAX_DELAY) == pdTRUE) { local_jump = jumpDetected; local_drop = dropDetected; xSemaphoreGive(eventDataMutex); } else { vTaskDelay(1); continue; }
+         if (xSemaphoreTake(eventDataMutex, portMAX_DELAY) == pdTRUE) { local_jump = jumpDetected; local_drop = dropDetected; local_180 = oneEightyDetected; xSemaphoreGive(eventDataMutex); } else { vTaskDelay(1); continue; }
          // ** NEW: Read thresholds **
          if (xSemaphoreTake(configMutex, portMAX_DELAY) == pdTRUE) {
               local_jumpThreshold = jumpThreshold;
@@ -787,6 +859,7 @@ void displayTask(void *pvParameters) {
           // Line 1: Jump/Drop Status
          display.setCursor(0, yPos); display.print("J:"); display.print(local_jump ? "Y" : "N");
          display.setCursor(32, yPos); display.print(" D:"); display.print(local_drop ? "Y" : "N");
+         display.setCursor(75, yPos); display.print(" 180:"); display.print(local_180 ? "Y" : "N");
          yPos += 10;
 
          // Line 2: Pitch and Jump Threshold

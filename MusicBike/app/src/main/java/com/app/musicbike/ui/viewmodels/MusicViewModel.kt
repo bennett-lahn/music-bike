@@ -53,6 +53,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _dropCount = MutableLiveData<Int>(0)
     val dropCount: LiveData<Int> get() = _dropCount
+
+    private val _oneEightyCount = MutableLiveData<Int>(0)
+    val oneEightyCount: LiveData<Int> get() = _oneEightyCount
     // --- END Ride Stats LiveData ---
 
     // Observers for MusicService's FMOD parameter LiveData

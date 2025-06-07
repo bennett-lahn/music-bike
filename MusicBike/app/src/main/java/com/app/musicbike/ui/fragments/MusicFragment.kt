@@ -195,7 +195,7 @@ class MusicFragment : Fragment() {
             override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
                 if (musicViewModel.isEventAuto.value != true) {
                     musicViewModel.setFmodParameter("Event", position.toFloat())
-                    if (position in 1..2) { // Jump or Drop
+                    if (position in 1..3) { // Jump, Drop, or 180
                         // The service now handles auto-resetting the "Event" parameter if needed.
                         // No need for handler here if service does it.
                     }
@@ -266,7 +266,8 @@ class MusicFragment : Fragment() {
         musicViewModel.isPlaying.observe(viewLifecycleOwner, Observer { isPlaying ->
             Log.d(TAG, "isPlaying changed: $isPlaying")
             binding.toggleButton.text = if (isPlaying) "Pause" else "Play"
-            
+
+            /*
             val serviceIntent = Intent(requireActivity(), MusicService::class.java)
             if (isPlaying) {
                 serviceIntent.action = MusicService.ACTION_START_INFERENCE
@@ -276,6 +277,7 @@ class MusicFragment : Fragment() {
                 Log.d(TAG, "Requesting MusicService to STOP inference.")
             }
             requireActivity().startService(serviceIntent) // Send command to MusicService
+            */
         })
 
         musicViewModel.currentBankName.observe(viewLifecycleOwner) { bankName ->
@@ -308,6 +310,7 @@ class MusicFragment : Fragment() {
                 val selection = when(eventParam.toInt()) {
                     1 -> 1 // Jump
                     2 -> 2 // Drop
+                    3 -> 3 // 180
                     else -> 0 // None
                 }
                 if (binding.eventSpinner.selectedItemPosition != selection) {
@@ -367,6 +370,10 @@ class MusicFragment : Fragment() {
         }
         musicViewModel.dropCount.observe(viewLifecycleOwner) { count ->
             binding.dropCountStatText.text = "Drops: $count"
+        }
+
+        musicViewModel.oneEightyCount.observe(viewLifecycleOwner) { count ->
+            binding.oneEightyCountStatText.text = "180s: $count"
         }
     }
 
