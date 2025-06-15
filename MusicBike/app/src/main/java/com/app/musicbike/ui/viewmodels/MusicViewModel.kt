@@ -53,6 +53,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _dropCount = MutableLiveData<Int>(0)
     val dropCount: LiveData<Int> get() = _dropCount
+
+    private val _oneEightyCount = MutableLiveData<Int>(0)
+    val oneEightyCount: LiveData<Int> get() = _oneEightyCount
     // --- END Ride Stats LiveData ---
 
     // Observers for MusicService's FMOD parameter LiveData
@@ -62,13 +65,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val fmodEventObserver = Observer<Float> { eventParam -> _eventDisplayValue.postValue(eventParam) }
     private val fmodHallDirObserver = Observer<Float> { directionParam -> _hallDirectionDisplayValue.postValue(directionParam) }
 
-    // --- ADDED: Observers for MusicService's RIDE STATS LiveData ---
+    // Observers for MusicService's RIDE STATS LiveData
     private val rideMaxSpeedObserver = Observer<Float> { value -> _maxSpeed.postValue(value) }
     private val rideMaxPosPitchObserver = Observer<Float> { value -> _maxPositivePitch.postValue(value) }
     private val rideMinNegPitchObserver = Observer<Float> { value -> _minNegativePitch.postValue(value) }
     private val rideJumpCountObserver = Observer<Int> { value -> _jumpCount.postValue(value) }
     private val rideDropCountObserver = Observer<Int> { value -> _dropCount.postValue(value) }
-    // --- END ADDED RIDE STATS Observers ---
+    private val ride180CountObserver = Observer<Int> { value -> _oneEightyCount.postValue(value) }
+    // RIDE STATS Observers
 
 
     // Removed init block that loaded stats directly; stats will come from service.
@@ -87,13 +91,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             this.musicService!!.currentFmodEventParameter.observe(owner, fmodEventObserver)
             this.musicService!!.currentFmodHallDirection.observe(owner, fmodHallDirObserver)
 
-            // --- ADDED: Observe RIDE STATS LiveData from MusicService ---
+            // Observe RIDE STATS LiveData from MusicService
             this.musicService!!.rideMaxSpeed.observe(owner, rideMaxSpeedObserver)
             this.musicService!!.rideMaxPositivePitch.observe(owner, rideMaxPosPitchObserver)
             this.musicService!!.rideMinNegativePitch.observe(owner, rideMinNegPitchObserver)
             this.musicService!!.rideJumpCount.observe(owner, rideJumpCountObserver)
             this.musicService!!.rideDropCount.observe(owner, rideDropCountObserver)
-            // --- END ADDED RIDE STATS Observation ---
+            this.musicService!!.ride180Count.observe(owner, ride180CountObserver)
+            // STATS Observation ---
 
             Log.d(TAG, "MusicService instance set and ALL observers attached.")
         } else {
@@ -108,13 +113,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             musicService?.currentFmodEventParameter?.removeObserver(fmodEventObserver)
             musicService?.currentFmodHallDirection?.removeObserver(fmodHallDirObserver)
 
-            // --- ADDED: Remove RIDE STATS Observers ---
+            // Remove RIDE STATS Observers
             musicService?.rideMaxSpeed?.removeObserver(rideMaxSpeedObserver)
             musicService?.rideMaxPositivePitch?.removeObserver(rideMaxPosPitchObserver)
             musicService?.rideMinNegativePitch?.removeObserver(rideMinNegPitchObserver)
             musicService?.rideJumpCount?.removeObserver(rideJumpCountObserver)
             musicService?.rideDropCount?.removeObserver(rideDropCountObserver)
-            // --- END ADDED ---
+            musicService?.ride180Count?.removeObserver(ride180CountObserver)
         }
         Log.d(TAG, "Removed observers from previous MusicService instance.")
     }

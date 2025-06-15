@@ -47,6 +47,7 @@ class MusicService : Service() {
         private const val KEY_MIN_NEGATIVE_PITCH = "minNegativePitch" // Will store as positive value
         private const val KEY_JUMP_COUNT = "jumpCount"
         private const val KEY_DROP_COUNT = "dropCount"
+        private const val KEY_180_COUNT = "oneEightyCount"
 
         init {
             try {
@@ -133,6 +134,9 @@ class MusicService : Service() {
 
     private val _rideDropCount = MutableLiveData<Int>(0)
     val rideDropCount: LiveData<Int> get() = _rideDropCount
+
+    private val _ride180Count = MutableLiveData<Int>(0)
+    val ride180Count: LiveData<Int> get() = _ride180Count
     // --- END RIDE STATS LiveData ---
 
     // Observers for BleService LiveData - UPDATED to also update stats
@@ -159,6 +163,7 @@ class MusicService : Service() {
         when (event.uppercase(java.util.Locale.US)) {
             "JUMP" -> incrementJumpCountStat()
             "DROP" -> incrementDropCountStat()
+            "180" -> increment180CountStat()
         }
 
         if (isEventInAutoMode && event != "NONE") {
@@ -526,6 +531,13 @@ class MusicService : Service() {
         Log.d(TAG, "Drop count: $newCount")
     }
 
+    private fun increment180CountStat() {
+        val newCount = (_ride180Count.value ?: 0) + 1
+        _ride180Count.postValue(newCount)
+        prefs.edit().putInt(KEY_180_COUNT, newCount).apply()
+        Log.d(TAG, "180 count: $newCount")
+    }
+
     fun resetRideStats() {
         Log.i(TAG, "Resetting ride stats in MusicService.")
         _rideMaxSpeed.postValue(0f)
@@ -533,6 +545,7 @@ class MusicService : Service() {
         _rideMinNegativePitch.postValue(0f)
         _rideJumpCount.postValue(0)
         _rideDropCount.postValue(0)
+        _ride180Count.postValue(0)
 
         prefs.edit()
             .putFloat(KEY_MAX_SPEED, 0f)
@@ -540,6 +553,7 @@ class MusicService : Service() {
             .putFloat(KEY_MIN_NEGATIVE_PITCH, 0f)
             .putInt(KEY_JUMP_COUNT, 0)
             .putInt(KEY_DROP_COUNT, 0)
+            .putInt(KEY_180_COUNT, 0)
             .apply()
     }
 
@@ -549,6 +563,7 @@ class MusicService : Service() {
         _rideMinNegativePitch.value = prefs.getFloat(KEY_MIN_NEGATIVE_PITCH, 0f)
         _rideJumpCount.value = prefs.getInt(KEY_JUMP_COUNT, 0)
         _rideDropCount.value = prefs.getInt(KEY_DROP_COUNT, 0)
+        _ride180Count.value = prefs.getInt(KEY_180_COUNT, 0)
         Log.i(TAG, "Ride stats loaded from SharedPreferences in MusicService.")
     }
 }

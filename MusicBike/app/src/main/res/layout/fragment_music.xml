@@ -187,7 +187,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:contentDescription="Select FMOD event type (None, Jump, Drop)"/>
+                android:contentDescription="Select FMOD event type (None, Jump, Drop, 180)"/>
 
             <com.google.android.material.switchmaterial.SwitchMaterial
                 android:id="@+id/eventModeSwitch"
@@ -214,6 +214,16 @@
             tools:text="Drops: 0"
             app:layout_constraintTop_toTopOf="@id/jumpCountStatText"
             app:layout_constraintStart_toEndOf="@id/jumpCountStatText"/>
+
+        <TextView
+            android:id="@+id/oneEightyCountStatText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            tools:text="180s: 0"
+            app:layout_constraintTop_toTopOf="@id/jumpCountStatText"
+            app:layout_constraintStart_toEndOf="@id/dropCountStatText" />
+
         <TextView
             android:id="@+id/hallDirectionLabel"
             android:layout_width="wrap_content"
