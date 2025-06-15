@@ -1,219 +1,304 @@
-//5/24/25 DLPF on the IMU
+/*
+ * Music Bike Sensor System - Main Arduino Code
+ * 
+ * This embedded system monitors bike motion and rider actions using:
+ * - MPU9250 IMU for orientation (pitch/roll/yaw) and g-force detection
+ * - Hall effect sensors for speed measurement and direction detection
+ * - OLED display for real-time status information
+ * - BLE communication for wireless data transmission
+ * - Potentiometers for real-time threshold tuning
+ * 
+ * The system detects various bike maneuvers:
+ * - Jumps (based on g-force drop below threshold)
+ * - Drops/Impacts (g-force spikes above threshold) 
+ * - 180-degree spins (gyroscope rotation + g-force anomalies)
+ * 
+ * Architecture: FreeRTOS multi-tasking system with mutex-protected shared data
+ * Last Updated: 5/24/25 - Added DLPF (Digital Low Pass Filter) on IMU
+ */
 
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-#include <driver/adc.h>
+// === HARDWARE INTERFACE LIBRARIES ===
+#include <Wire.h>                // I2C communication for IMU and OLED
+#include <Adafruit_GFX.h>        // Graphics library for OLED display
+#include <Adafruit_SSD1306.h>    // OLED display driver (128x64 pixels)
 
-// --- FreeRTOS Includes ---
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
+// === BLUETOOTH LOW ENERGY LIBRARIES ===
+#include <BLEDevice.h>           // ESP32 BLE device initialization
+#include <BLEServer.h>           // BLE server for hosting characteristics
+#include <BLEUtils.h>            // BLE utility functions
+#include <BLE2902.h>             // BLE descriptor for notifications
+
+// === ESP32 SYSTEM LIBRARIES ===
+#include <driver/adc.h>          // ADC configuration for potentiometer readings
+
+// === FREERTOS LIBRARIES ===
+#include "freertos/FreeRTOS.h"   // Real-time operating system core
+#include "freertos/task.h"       // Task creation and management
+#include "freertos/semphr.h"     // Semaphores/mutexes for thread safety
+
+
 
 //==============================================================================
-// CONFIGURATION SETTINGS
+// HARDWARE PIN ASSIGNMENTS & CONFIGURATION
 //==============================================================================
 
-// Pin definitions
-#define SDA_PIN 18
-#define SCL_PIN 15
-#define ZERO_BUTTON_PIN 8
-#define HALL_SENSOR_PIN 9
-#define HALL_SENSOR_PIN_2 46 
-#define BLE_LED_PIN 3
-#define JUMP_THRESH_POT_PIN 12 
-#define LAND_THRESH_POT_PIN 11
-#define DROP_THRESH_POT_PIN 10
+// === I2C COMMUNICATION PINS ===
+#define SDA_PIN 18               // I2C Serial Data line (connect to IMU and OLED)
+#define SCL_PIN 15               // I2C Serial Clock line (connect to IMU and OLED)
 
-// Threshold variables
-// Default values, will be overwritten by potentiometers
-float jumpThreshold = 0.5;      // gForce check (< threshold for takeoff)
-float landingThreshold = 2.0;   // gForce check (> threshold for landing)
-float dropThreshold = 2.5;      // gForce check (> threshold spike for drop)
+// === USER INPUT PINS ===
+#define ZERO_BUTTON_PIN 8        // Button to zero/calibrate IMU orientation offsets
 
-//Define tunable ranges for potentiometers
-#define JUMP_THRESH_MIN 0.1f
-#define JUMP_THRESH_MAX 1.5f
-#define LAND_THRESH_MIN 1.0f
-#define LAND_THRESH_MAX 4.0f
-#define DROP_THRESH_MIN 1.5f
-#define DROP_THRESH_MAX 5.0f
+// === SENSOR INPUT PINS ===
+#define HALL_SENSOR_PIN 9        // Primary hall effect sensor for speed detection
+#define HALL_SENSOR_PIN_2 46     // Secondary hall sensor for direction detection
+                                 // (positioned 90° from primary sensor on wheel)
 
-// Other Thresholds Constants
-#define JUMP_DURATION_MIN 100
-#define DIRECTION_THRESHOLD 0.3 // For IMU-based direction
-#define IMU_DIRECTION_ACCEL_THRESHOLD 0.3 // Threshold for IMU-based direction change (+/- this value)
+// === ANALOG INPUT PINS (Potentiometers for real-time threshold tuning) ===
+#define JUMP_THRESH_POT_PIN 12   // Potentiometer to adjust jump detection sensitivity
+#define LAND_THRESH_POT_PIN 11   // Potentiometer to adjust landing detection sensitivity  
+#define DROP_THRESH_POT_PIN 10   // Potentiometer to adjust drop/impact detection sensitivity
 
-// --- 180 Detection Constants ---
-#define GFORCE_ANOMALY_UPPER 2.37f
-#define GFORCE_ANOMALY_LOWER 0.60f
-#define GFORCE_ANOMALY_WINDOW_MS 1500
-#define YAW_RATE_THRESHOLD_MIN 90.0f // deg/s for spin detection
-#define SPIN_SCORE_THRESHOLD 0.8f
-#define SPIN_SCORE_DECAY_PER_SEC (1.0f / 3.0f) // Full decay over 3 seconds
-#define TOTAL_ROTATION_THRESHOLD 80.0f // Required degrees of rotation
-#define ROTATION_DECAY_FACTOR 0.99f
+// === OUTPUT PINS ===
+#define BLE_LED_PIN 3            // LED indicator for BLE connection status
 
-// Physical constants
-#define WHEEL_DIAMETER_INCHES 26.0
-#define WHEEL_CIRCUMFERENCE_CM (WHEEL_DIAMETER_INCHES * 2.54 * 3.14159)
-#define HALF_CIRCUMFERENCE_CM (WHEEL_CIRCUMFERENCE_CM / 2.0)
+//==============================================================================
+// DETECTION THRESHOLDS & TUNING PARAMETERS
+//==============================================================================
 
-// Timing constants from original code (if specific names were used there)
-const unsigned long SPEED_TIMEOUT = 3000;
-const unsigned long EVENT_DISPLAY_DURATION = 2000;
-const unsigned long debounceDelay = 50;
-const unsigned long directionDetectionTimeout = 500;
+// === G-FORCE THRESHOLDS (g = 9.8 m/s²) ===
+// These are default values - actual values set by potentiometers during runtime
+float jumpThreshold = 0.5;      // Jump takeoff: g-force drops below this (weightlessness)
+float landingThreshold = 2.0;   // Jump landing: g-force exceeds this (impact)
+float dropThreshold = 2.5;      // Drop detection: sudden g-force spike above this
 
-// MPU9250 registers
-#define MPU9250_ADDRESS 0x68
-#define ACCEL_XOUT_H 0x3B
-#define GYRO_XOUT_H 0x43
+// === POTENTIOMETER MAPPING RANGES ===
+// These define the min/max values that potentiometers can set for each threshold
+#define JUMP_THRESH_MIN 0.1f     // Minimum jump sensitivity (very sensitive)
+#define JUMP_THRESH_MAX 1.5f     // Maximum jump sensitivity (less sensitive)
+#define LAND_THRESH_MIN 1.0f     // Minimum landing detection threshold
+#define LAND_THRESH_MAX 4.0f     // Maximum landing detection threshold
+#define DROP_THRESH_MIN 1.5f     // Minimum drop detection threshold
+#define DROP_THRESH_MAX 5.0f     // Maximum drop detection threshold
 
-// Display settings
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1 // Usually -1 if sharing Arduino reset pin
-#define SCREEN_ADDRESS 0x3C
+// === TIMING THRESHOLDS ===
+#define JUMP_DURATION_MIN 100                    // Minimum airtime (ms) to qualify as jump
+#define DIRECTION_THRESHOLD 0.3                  // IMU direction change sensitivity
+#define IMU_DIRECTION_ACCEL_THRESHOLD 0.3        // Acceleration threshold for direction detection
+
+// === 180-DEGREE SPIN DETECTION PARAMETERS ===
+#define GFORCE_ANOMALY_UPPER 2.37f              // Upper g-force anomaly threshold
+#define GFORCE_ANOMALY_LOWER 0.60f              // Lower g-force anomaly threshold  
+#define GFORCE_ANOMALY_WINDOW_MS 1500           // Time window to consider g-force anomalies (ms)
+#define YAW_RATE_THRESHOLD_MIN 90.0f            // Minimum rotation rate (deg/s) for spin detection
+#define SPIN_SCORE_THRESHOLD 0.8f               // Required spin score to trigger 180° detection
+#define SPIN_SCORE_DECAY_PER_SEC (1.0f / 3.0f) // Spin score decay rate (full decay in 3 seconds)
+#define TOTAL_ROTATION_THRESHOLD 80.0f          // Minimum rotation (degrees) for 180° detection
+#define ROTATION_DECAY_FACTOR 0.99f             // Rotation tracking decay factor per cycle
+
+// === PHYSICAL CONSTANTS (Bike Specifications) ===
+#define WHEEL_DIAMETER_INCHES 26.0                              // Bike wheel diameter
+#define WHEEL_CIRCUMFERENCE_CM (WHEEL_DIAMETER_INCHES * 2.54 * 3.14159)  // Full wheel circumference in cm
+#define HALF_CIRCUMFERENCE_CM (WHEEL_CIRCUMFERENCE_CM / 2.0)    // Half circumference (distance between hall sensors)
+
+// === SYSTEM TIMING CONSTANTS ===
+const unsigned long SPEED_TIMEOUT = 3000;              // Time (ms) before speed resets to zero
+const unsigned long EVENT_DISPLAY_DURATION = 2000;     // Time (ms) to display detected events  
+const unsigned long debounceDelay = 50;                // Button debounce delay (ms)
+const unsigned long directionDetectionTimeout = 500;   // Timeout for direction detection sequence (ms)
+
+// === MPU9250 IMU REGISTER ADDRESSES ===
+#define MPU9250_ADDRESS 0x68    // I2C address of MPU9250 IMU chip
+#define ACCEL_XOUT_H 0x3B       // Register address for accelerometer X-axis high byte
+#define GYRO_XOUT_H 0x43        // Register address for gyroscope X-axis high byte
+
+// === OLED DISPLAY CONFIGURATION ===
+#define SCREEN_WIDTH 128        // OLED display width in pixels
+#define SCREEN_HEIGHT 64        // OLED display height in pixels  
+#define OLED_RESET -1           // Reset pin (-1 = sharing Arduino reset pin)
+#define SCREEN_ADDRESS 0x3C     // I2C address of OLED display
 // Note: Adafruit_SSD1306 display object is declared later globally
 
 //==============================================================================
-// BLE CONFIGURATION: Define Service and Characteristic UUIDs
+// BLUETOOTH LOW ENERGY (BLE) CONFIGURATION
+// Each characteristic represents a different data stream sent to connected devices
 //==============================================================================
 
+// === BLE SERVICE & CHARACTERISTIC UUIDs ===
+// Main service UUID that groups all bike sensor characteristics
 #define SERVICE_UUID                      "0fb899fa-2b3a-4e11-911d-4fa05d130dc1"
-#define SPEED_CHARACTERISTIC_UUID         "a635fed5-9a19-4e31-8091-84d020481329"
-#define PITCH_CHARACTERISTIC_UUID         "726c4b96-bc56-47d2-95a1-a6c49cce3a1f"
-#define ROLL_CHARACTERISTIC_UUID          "a1e929e3-5a2e-4418-806a-c50ab877d126"
-#define YAW_CHARACTERISTIC_UUID           "cd6fc0f8-089a-490e-8e36-74af84977c7b"
-#define GFORCE_CHARACTERISTIC_UUID        "a6210f30-654f-32ea-9e37-432a639fb38e"
-#define EVENT_CHARACTERISTIC_UUID         "26205d71-58d1-45e6-9ad1-1931cd7343c3"
-#define IMU_DIRECTION_CHARACTERISTIC_UUID "ceb04cf6-0555-4243-a27b-c85986ab4bd7"
-#define HALL_DIRECTION_CHARACTERISTIC_UUID "f231de63-475c-463d-9b3f-f338d7458bb9"
-#define IMU_SPEED_STATE_CHARACTERISTIC_UUID "738f5e54-5479-4941-ae13-caf4a9b07b2e"
+
+// Data stream characteristics - each sends specific sensor readings
+#define SPEED_CHARACTERISTIC_UUID         "a635fed5-9a19-4e31-8091-84d020481329"  // Speed (km/h) from hall sensors
+#define PITCH_CHARACTERISTIC_UUID         "726c4b96-bc56-47d2-95a1-a6c49cce3a1f"  // Bike pitch angle (degrees)
+#define ROLL_CHARACTERISTIC_UUID          "a1e929e3-5a2e-4418-806a-c50ab877d126"  // Bike roll angle (degrees)  
+#define YAW_CHARACTERISTIC_UUID           "cd6fc0f8-089a-490e-8e36-74af84977c7b"  // Bike yaw/heading (degrees)
+#define GFORCE_CHARACTERISTIC_UUID        "a6210f30-654f-32ea-9e37-432a639fb38e"  // G-force magnitude
+
+// Event characteristics - send notifications when specific events occur  
+#define EVENT_CHARACTERISTIC_UUID         "26205d71-58d1-45e6-9ad1-1931cd7343c3"  // Event codes (jump=1, drop=2, 180=3)
+
+// Direction and state characteristics
+#define IMU_DIRECTION_CHARACTERISTIC_UUID "ceb04cf6-0555-4243-a27b-c85986ab4bd7"   // IMU-based direction (1=forward, 0=reverse)
+#define HALL_DIRECTION_CHARACTERISTIC_UUID "f231de63-475c-463d-9b3f-f338d7458bb9"  // Hall sensor direction (1=forward, 0=reverse)
+#define IMU_SPEED_STATE_CHARACTERISTIC_UUID "738f5e54-5479-4941-ae13-caf4a9b07b2e" // Speed state (0=stop, 1=medium, 2=fast)
 
 //==============================================================================
-// GLOBAL VARIABLES & MUTEXES
+// GLOBAL VARIABLES & THREAD SYNCHRONIZATION
+// Data is organized by protection domain (which mutex guards each data group)
 //==============================================================================
 
-// --- Mutex Handles ---
-SemaphoreHandle_t imuDataMutex = NULL;
-SemaphoreHandle_t hallDataMutex = NULL;
-SemaphoreHandle_t eventDataMutex = NULL;
-SemaphoreHandle_t offsetMutex = NULL;
-SemaphoreHandle_t bleConnectionMutex = NULL;
-SemaphoreHandle_t configMutex = NULL;
+// === FREERTOS MUTEX HANDLES ===
+// These mutexes protect shared data from concurrent access by multiple tasks
+SemaphoreHandle_t imuDataMutex = NULL;        // Protects: pitch, roll, yaw, gForce, accel*, gyro*
+SemaphoreHandle_t hallDataMutex = NULL;       // Protects: currentSpeed, hallDirectionForward, hallSensorValue*  
+SemaphoreHandle_t eventDataMutex = NULL;      // Protects: jumpDetected, dropDetected, oneEightyDetected, imuDirection*, imuSpeedState
+SemaphoreHandle_t offsetMutex = NULL;         // Protects: pitchOffset, rollOffset, yawOffset (calibration values)
+SemaphoreHandle_t bleConnectionMutex = NULL;  // Protects: deviceConnected, oldDeviceConnected
+SemaphoreHandle_t configMutex = NULL;         // Protects: jumpThreshold, landingThreshold, dropThreshold
 
-// --- IMU Data (Protected by imuDataMutex) ---
-float pitch = 0.0, roll = 0.0, yaw = 0.0;
-float gForce = 1.0; // Initialize to 1g
-float accelX = 0.0, accelY = 0.0, accelZ = 0.0; // Raw scaled accel
-float gyroX = 0.0, gyroY = 0.0, gyroZ = 0.0;   // Raw scaled gyro
+// === IMU SENSOR DATA (Protected by imuDataMutex) ===
+// Raw orientation angles from MPU9250 sensor
+float pitch = 0.0, roll = 0.0, yaw = 0.0;       // Euler angles in degrees
+float gForce = 1.0;                             // Vertical g-force magnitude (1.0 = 1g at rest)
+float accelX = 0.0, accelY = 0.0, accelZ = 0.0; // Raw scaled accelerometer readings (g's)
+float gyroX = 0.0, gyroY = 0.0, gyroZ = 0.0;    // Raw scaled gyroscope readings (deg/s)
 
-// --- Orientation Offsets (Protected by offsetMutex) ---
+// === CALIBRATION OFFSETS (Protected by offsetMutex) ===
+// Zero position offsets set by pressing the zero button
 float pitchOffset = 0.0, rollOffset = 0.0, yawOffset = 0.0;
 
-// --- Hall Sensor Data (Protected by hallDataMutex) ---
-float currentSpeed = 0.0;          // km/h
-bool hallDirectionForward = true;
-int hallSensorValue = HIGH;       // Current raw value
-int hallSensorValue2 = HIGH;      // Current raw value 2
+// === HALL SENSOR DATA (Protected by hallDataMutex) ===
+// Speed and direction data from magnetic hall effect sensors on wheel
+float currentSpeed = 0.0;          // Current bike speed in km/h
+bool hallDirectionForward = true;  // Direction from hall sensor timing (true=forward, false=reverse)
+int hallSensorValue = HIGH;        // Current digital state of primary hall sensor
+int hallSensorValue2 = HIGH;       // Current digital state of secondary hall sensor
 
-// --- Processed/Event Data (Protected by eventDataMutex) ---
-bool jumpDetected = false;
-bool dropDetected = false;
-bool oneEightyDetected = false;
-bool imuDirectionForward = true;
-int imuSpeedState = 0; // 0=Stop/Slow, 1=Medium, 2=Fast
+// === EVENT DETECTION DATA (Protected by eventDataMutex) ===
+// Boolean flags for detected bike maneuvers and motion states
+bool jumpDetected = false;          // True when jump event is currently active/displaying
+bool dropDetected = false;          // True when drop/impact event is currently active/displaying  
+bool oneEightyDetected = false;     // True when 180° spin event is currently active/displaying
+bool imuDirectionForward = true;    // Direction calculated from IMU acceleration patterns
+int imuSpeedState = 0;              // Speed state from IMU: 0=Stop/Slow, 1=Medium, 2=Fast
 
-// --- BLE State (Protected by bleConnectionMutex) ---
-volatile bool deviceConnected = false;
-bool oldDeviceConnected = false;   
+// === BLE CONNECTION STATE (Protected by bleConnectionMutex) ===
+volatile bool deviceConnected = false;  // Current BLE connection status (volatile for ISR safety)
+bool oldDeviceConnected = false;        // Previous connection state for change detection
 
-// --- BLE Objects (Global, initialized in setup) ---
-BLEServer* pServer = NULL;
-BLECharacteristic* pSpeedCharacteristic = NULL;
-BLECharacteristic* pPitchCharacteristic = NULL;
-BLECharacteristic* pRollCharacteristic = NULL;
-BLECharacteristic* pYawCharacteristic = NULL;
-BLECharacteristic* pGForceCharacteristic = NULL;
-BLECharacteristic* pEventCharacteristic = NULL;
-BLECharacteristic* pImuDirectionCharacteristic = NULL;
-BLECharacteristic* pHallDirectionCharacteristic = NULL;
-BLECharacteristic* pImuSpeedStateCharacteristic = NULL;
+// === BLE OBJECTS (Global, initialized in setup) ===
+// These pointers reference BLE server and characteristic objects created during initialization
+BLEServer* pServer = NULL;                           // Main BLE server instance
+BLECharacteristic* pSpeedCharacteristic = NULL;     // Speed data transmission characteristic  
+BLECharacteristic* pPitchCharacteristic = NULL;     // Pitch angle transmission characteristic
+BLECharacteristic* pRollCharacteristic = NULL;      // Roll angle transmission characteristic
+BLECharacteristic* pYawCharacteristic = NULL;       // Yaw angle transmission characteristic
+BLECharacteristic* pGForceCharacteristic = NULL;    // G-force transmission characteristic
+BLECharacteristic* pEventCharacteristic = NULL;     // Event notification characteristic
+BLECharacteristic* pImuDirectionCharacteristic = NULL;    // IMU-based direction characteristic
+BLECharacteristic* pHallDirectionCharacteristic = NULL;   // Hall sensor direction characteristic
+BLECharacteristic* pImuSpeedStateCharacteristic = NULL;   // IMU speed state characteristic
 
-// --- Display Object (Global) ---
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// === HARDWARE OBJECTS ===
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);  // OLED display driver instance
 
-// --- Task Handles ---
-TaskHandle_t imuTaskHandle = NULL;
-TaskHandle_t hallSensorTaskHandle = NULL;
-TaskHandle_t processingTaskHandle = NULL;
-TaskHandle_t bleTaskHandle = NULL;
-TaskHandle_t displayTaskHandle = NULL;
-TaskHandle_t potTuningTaskHandle = NULL;
+// === FREERTOS TASK HANDLES ===
+// These handles allow task management and inter-task communication
+TaskHandle_t imuTaskHandle = NULL;          // Handle for IMU reading and orientation calculation task
+TaskHandle_t hallSensorTaskHandle = NULL;   // Handle for hall sensor speed/direction detection task  
+TaskHandle_t processingTaskHandle = NULL;   // Handle for event detection and button handling task
+TaskHandle_t bleTaskHandle = NULL;          // Handle for BLE data transmission task
+TaskHandle_t displayTaskHandle = NULL;      // Handle for OLED display update task
+TaskHandle_t potTuningTaskHandle = NULL;    // Handle for potentiometer threshold tuning task
 
 //==============================================================================
-// BLE CALLBACK CLASS
+// BLE CONNECTION CALLBACK HANDLER
+// Manages BLE client connection and disconnection events
 //==============================================================================
 class MyServerCallbacks: public BLEServerCallbacks {
+    // Called when a BLE client (phone/computer) connects to this device
     void onConnect(BLEServer* pServerInstance) {
+        // Thread-safe update of connection status using mutex
         if (xSemaphoreTake(bleConnectionMutex, portMAX_DELAY) == pdTRUE) {
             deviceConnected = true;
             xSemaphoreGive(bleConnectionMutex);
         }
         Serial.println("BLE Device Connected");
-        digitalWrite(BLE_LED_PIN, HIGH);
+        digitalWrite(BLE_LED_PIN, HIGH);  // Turn on LED to indicate connection
     }
 
+    // Called when a BLE client disconnects from this device
     void onDisconnect(BLEServer* pServerInstance) {
+        // Thread-safe update of connection status using mutex
          if (xSemaphoreTake(bleConnectionMutex, portMAX_DELAY) == pdTRUE) {
             deviceConnected = false;
             xSemaphoreGive(bleConnectionMutex);
         }
         Serial.println("BLE Device Disconnected");
-        digitalWrite(BLE_LED_PIN, LOW);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        pServer->startAdvertising();
+        digitalWrite(BLE_LED_PIN, LOW);   // Turn off LED to indicate disconnection
+        vTaskDelay(pdMS_TO_TICKS(500));   // Small delay before restart
+        pServer->startAdvertising();      // Resume advertising to allow reconnection
         Serial.println("BLE Advertising restarted");
     }
 };
 
 //==============================================================================
-// TASK FUNCTIONS
+// FREERTOS TASK FUNCTIONS
+// Each task runs independently with its own priority and execution frequency
 //==============================================================================
 
 //------------------------------------------------------------------------------
-// Task: Read MPU9250 and Calculate Orientation
+// IMU TASK: Read MPU9250 Sensor & Calculate 3D Orientation
+// 
+// Purpose: Continuously reads accelerometer and gyroscope data from MPU9250,
+//          applies Mahony filter algorithm to calculate stable pitch/roll/yaw,
+//          and computes vertical g-force for jump/drop detection.
+//
+// Frequency: ~50Hz (20ms cycle time)
+// Priority: 5 (Highest - time-critical sensor fusion)
+// Core: 1
 //------------------------------------------------------------------------------
 void imuTask(void *pvParameters) {
     Serial.println("imuTask started");
     TickType_t xLastWakeTime;
     const TickType_t xFrequency = pdMS_TO_TICKS(20); // Run ~50Hz
 
-    // Mahony filter internal variables
-    static float q0 = 1.0f, q1 = 0, q2 = 0, q3 = 0;
-    static float twoKp = 2.0f * 0.5f;
-    static float twoKi = 2.0f * 0.0f;
-    static unsigned long lastQuatTime = 0;
-    static float integralFBx = 0, integralFBy = 0, integralFBz = 0;
+    // === MAHONY FILTER STATE VARIABLES ===
+    // Mahony filter fuses accelerometer and gyroscope data for stable orientation
+    static float q0 = 1.0f, q1 = 0, q2 = 0, q3 = 0;      // Quaternion components (w,x,y,z)
+    static float twoKp = 2.0f * 0.5f;                    // Proportional gain (2 * Kp)
+    static float twoKi = 2.0f * 0.0f;                    // Integral gain (2 * Ki) - set to 0 for now
+    static unsigned long lastQuatTime = 0;               // Timestamp for delta-time calculation
+    static float integralFBx = 0, integralFBy = 0, integralFBz = 0;  // Integral error terms
 
-    // Initialize MPU9250 communication here
-    Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true); // Wake up MPU (PWR_MGMT_1)
+    // === MPU9250 INITIALIZATION ===
+    // Configure the IMU for optimal performance
+    Serial.println("Initializing MPU9250...");
+    
+    // Wake up the MPU9250
+    Wire.beginTransmission(MPU9250_ADDRESS); 
+    Wire.write(0x6B);  // PWR_MGMT_1 register
+    Wire.write(0);     // Clear sleep bit
+    Wire.endTransmission(true);
     vTaskDelay(pdMS_TO_TICKS(100)); // Wait for MPU to stabilize
 
-    // Set Accelerometer Full Scale Range (ACCEL_CONFIG - 0x1C)
-    Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1C); Wire.write(0x00); Wire.endTransmission(true); // Accel +/- 2g (AFS_SEL=0)
+    // Configure accelerometer range: ±2g (most sensitive)
+    Wire.beginTransmission(MPU9250_ADDRESS); 
+    Wire.write(0x1C);  // ACCEL_CONFIG register
+    Wire.write(0x00);  // AFS_SEL=0 -> ±2g range (16384 LSB/g)
+    Wire.endTransmission(true);
 
-    // Set Gyroscope Full Scale Range (GYRO_CONFIG - 0x1B)
-    Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1B); Wire.write(0x00); Wire.endTransmission(true); // Gyro +/- 250dps (FS_SEL=0)
+    // Configure gyroscope range: ±250°/s (good balance of range vs. precision)
+    Wire.beginTransmission(MPU9250_ADDRESS); 
+    Wire.write(0x1B);  // GYRO_CONFIG register  
+    Wire.write(0x00);  // FS_SEL=0 -> ±250°/s range (131 LSB/°/s)
+    Wire.endTransmission(true);
 
-    // Configure DLPF ---
-    // Gyroscope DLPF Configuration
+    // === DIGITAL LOW PASS FILTER (DLPF) CONFIGURATION ===
+    // Reduces noise and vibration in sensor readings
+    
+    // Gyroscope DLPF: Setting 1 = 184Hz bandwidth, 2.9ms delay
     uint8_t gyroDLPFSetting = 1;
     Wire.beginTransmission(MPU9250_ADDRESS);
     Wire.write(0x1A); // CONFIG register
@@ -221,86 +306,127 @@ void imuTask(void *pvParameters) {
     Wire.endTransmission(true);
     Serial.print("Set Gyro DLPF to: "); Serial.println(gyroDLPFSetting);
 
-    // Accelerometer DLPF Configuration
+    // Accelerometer DLPF: Setting 1 = 184Hz bandwidth, 5.8ms delay  
     uint8_t accelDLPFSetting = 1;
     Wire.beginTransmission(MPU9250_ADDRESS);
     Wire.write(0x1D); // ACCEL_CONFIG_2 register
     Wire.write(accelDLPFSetting);
     Wire.endTransmission(true);
     Serial.print("Set Accel DLPF to: "); Serial.println(accelDLPFSetting);
-    // --- End of DLPF Configuration ---
 
+    // Initialize timing for filter algorithm
     lastQuatTime = micros();
     xLastWakeTime = xTaskGetTickCount();
 
+    // === MAIN TASK LOOP ===
     while (1) {
-        // --- Read Raw Data ---
+        // --- READ RAW SENSOR DATA ---
         int16_t raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz;
-        // Read Accel
-        Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(ACCEL_XOUT_H); Wire.endTransmission(false);
+        
+        // Read accelerometer data (6 bytes starting from ACCEL_XOUT_H)
+        Wire.beginTransmission(MPU9250_ADDRESS); 
+        Wire.write(ACCEL_XOUT_H); 
+        Wire.endTransmission(false);
         Wire.requestFrom(MPU9250_ADDRESS, 6, true);
-        raw_ax = Wire.read() << 8 | Wire.read(); raw_ay = Wire.read() << 8 | Wire.read(); raw_az = Wire.read() << 8 | Wire.read();
-        // Read Gyro
-        Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(GYRO_XOUT_H); Wire.endTransmission(false);
+        raw_ax = Wire.read() << 8 | Wire.read(); 
+        raw_ay = Wire.read() << 8 | Wire.read(); 
+        raw_az = Wire.read() << 8 | Wire.read();
+        
+        // Read gyroscope data (6 bytes starting from GYRO_XOUT_H)
+        Wire.beginTransmission(MPU9250_ADDRESS); 
+        Wire.write(GYRO_XOUT_H); 
+        Wire.endTransmission(false);
         Wire.requestFrom(MPU9250_ADDRESS, 6, true);
-        raw_gx = Wire.read() << 8 | Wire.read(); raw_gy = Wire.read() << 8 | Wire.read(); raw_gz = Wire.read() << 8 | Wire.read();
+        raw_gx = Wire.read() << 8 | Wire.read(); 
+        raw_gy = Wire.read() << 8 | Wire.read(); 
+        raw_gz = Wire.read() << 8 | Wire.read();
 
-        // --- Local calculation variables ---
+        // --- CONVERT RAW DATA TO PHYSICAL UNITS ---
+        // Convert to g's (±2g range, 16384 LSB/g)
         float local_ax = raw_ax / 16384.0f;
         float local_ay = raw_ay / 16384.0f;
         float local_az = raw_az / 16384.0f;
+        
+        // Convert to degrees/second (±250°/s range, 131 LSB/°/s)
         float local_gx = raw_gx / 131.0f;
         float local_gy = raw_gy / 131.0f;
         float local_gz = raw_gz / 131.0f;
 
-        // --- Calculate Angles ---
+        // --- CALCULATE ORIENTATION USING MAHONY FILTER ---
+        // The Mahony filter combines gyroscope and accelerometer data to estimate orientation
         unsigned long now = micros();
-        float dt = (now - lastQuatTime) * 1e-6f; // Delta t in seconds
+        float dt = (now - lastQuatTime) * 1e-6f; // Delta time in seconds since last update
         lastQuatTime = now;
         if (dt <= 0) dt = 1e-3; // Prevent division by zero or negative dt
 
-        // (Mahony filter calculations remain the same)
+        // Mahony filter algorithm implementation
+        // Convert gyroscope from deg/s to rad/s for calculations
         float ax_calc = local_ax, ay_calc = local_ay, az_calc = local_az;
         float gx_calc = local_gx * PI/180.0f, gy_calc = local_gy * PI/180.0f, gz_calc = local_gz * PI/180.0f;
 
+        // Normalize accelerometer measurement (to use as gravity reference)
         float norm = sqrt(ax_calc*ax_calc + ay_calc*ay_calc + az_calc*az_calc);
         if (norm > 0.0f) {
            ax_calc /= norm; ay_calc /= norm; az_calc /= norm;
         } else {
-             ax_calc = 0; ay_calc = 0; az_calc = 0;
+             ax_calc = 0; ay_calc = 0; az_calc = 0;  // Prevent division by zero
         }
 
-        float vx = 2.0f*(q1*q3 - q0*q2); float vy = 2.0f*(q0*q1 + q2*q3); float vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
-        float ex = (ay_calc*vz - az_calc*vy); float ey = (az_calc*vx - ax_calc*vz); float ez = (ax_calc*vy - ay_calc*vx);
+        // Estimated direction of gravity from current quaternion
+        float vx = 2.0f*(q1*q3 - q0*q2); 
+        float vy = 2.0f*(q0*q1 + q2*q3); 
+        float vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
+        
+        // Error between measured and estimated gravity direction (cross product)
+        float ex = (ay_calc*vz - az_calc*vy); 
+        float ey = (az_calc*vx - ax_calc*vz); 
+        float ez = (ax_calc*vy - ay_calc*vx);
 
+        // Apply integral feedback if enabled (Ki > 0)
         if (twoKi > 0.0f) {
-           integralFBx += twoKi * ex * dt; integralFBy += twoKi * ey * dt; integralFBz += twoKi * ez * dt;
-           gx_calc += integralFBx; gy_calc += integralFBy; gz_calc += integralFBz;
+           integralFBx += twoKi * ex * dt; 
+           integralFBy += twoKi * ey * dt; 
+           integralFBz += twoKi * ez * dt;
+           gx_calc += integralFBx; 
+           gy_calc += integralFBy; 
+           gz_calc += integralFBz;
         }
-        gx_calc += twoKp * ex; gy_calc += twoKp * ey; gz_calc += twoKp * ez;
+        
+        // Apply proportional feedback (corrects gyroscope bias)
+        gx_calc += twoKp * ex; 
+        gy_calc += twoKp * ey; 
+        gz_calc += twoKp * ez;
 
+        // Integrate quaternion rate of change (quaternion derivative)
         float qDot0 = 0.5f * (-q1*gx_calc - q2*gy_calc - q3*gz_calc);
         float qDot1 = 0.5f * ( q0*gx_calc + q2*gz_calc - q3*gy_calc);
         float qDot2 = 0.5f * ( q0*gy_calc - q1*gz_calc + q3*gx_calc);
         float qDot3 = 0.5f * ( q0*gz_calc + q1*gy_calc - q2*gx_calc);
 
+        // Update quaternion components
         q0 += qDot0 * dt; q1 += qDot1 * dt; q2 += qDot2 * dt; q3 += qDot3 * dt;
+        
+        // Normalize quaternion to maintain unit length
         norm = sqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3);
         q0 /= norm; q1 /= norm; q2 /= norm; q3 /= norm;
 
-        // --- Calculate Euler Angles and G-Force ---
+        // --- CONVERT QUATERNION TO EULER ANGLES ---
+        // Calculate pitch, roll, and yaw from normalized quaternion
         float local_pitch = atan2(2.0f*(q0*q1 + q2*q3), 1.0f - 2.0f*(q1*q1 + q2*q2)) * 180.0f/PI;
         float local_roll  = asin (2.0f*(q0*q2 - q3*q1)) * 180.0f/PI;
         float local_yaw   = atan2(2.0f*(q0*q3 + q1*q2), 1.0f - 2.0f*(q2*q2 + q3*q3)) * 180.0f/PI;
-        if (local_yaw < 0) local_yaw += 360.0f;
+        if (local_yaw < 0) local_yaw += 360.0f;  // Ensure yaw is 0-360°
 
+        // --- CALCULATE VERTICAL G-FORCE ---
+        // Project acceleration onto gravity vector to get vertical component
         float gravityVectorX = 2.0f * (q1 * q3 - q0 * q2);
         float gravityVectorY = 2.0f * (q0 * q1 + q2 * q3);
         float gravityVectorZ = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
         float verticalAcceleration = local_ax * gravityVectorX + local_ay * gravityVectorY + local_az * gravityVectorZ;
-        float local_gForce = verticalAcceleration;
+        float local_gForce = verticalAcceleration;  // This is the g-force for jump/drop detection
 
-        // --- Update Shared Variables (Protected by Mutex) ---
+        // --- UPDATE SHARED VARIABLES (Thread-Safe) ---
+        // Copy calculated values to global variables protected by mutex
         if (xSemaphoreTake(imuDataMutex, portMAX_DELAY) == pdTRUE) {
             pitch = local_pitch;
             roll = local_roll;
@@ -320,21 +446,34 @@ void imuTask(void *pvParameters) {
 }
 
 //------------------------------------------------------------------------------
-// Task: Read Hall Sensors, Calculate Speed and Direction
+// HALL SENSOR TASK: Speed Measurement & Direction Detection
+//
+// Purpose: Monitors two hall effect sensors mounted on the bike wheel to:
+//          - Calculate speed based on time between sensor triggers
+//          - Determine direction based on which sensor triggers first
+//          - Handle timeouts to reset speed to zero when stopped
+//
+// Frequency: ~200Hz (5ms cycle time) 
+// Priority: 4 (High - time-sensitive for accurate speed measurement)
+// Core: 1
+//
+// Hardware Setup: Two hall sensors positioned 90° apart on wheel, 
+//                triggered by magnets on spokes
 //------------------------------------------------------------------------------
 void hallSensorTask(void *pvParameters) {
     Serial.println("hallSensorTask started");
     TickType_t xLastWakeTime;
     const TickType_t xFrequency = pdMS_TO_TICKS(5); // Run frequently ~200Hz
 
-    // Internal hall task variables (static within the task)
-    static int lastHallSensorValue = HIGH;
-    static int lastHallSensorValue2 = HIGH;
-    static unsigned long hall1TriggerTime = 0;
-    static unsigned long hall2TriggerTime = 0;
-    static bool hall1Triggered = false;
-    static bool hall2Triggered = false;
-    static unsigned long lastTriggerTime = 0; // For speed calc
+    // === INTERNAL STATE VARIABLES ===
+    // These track sensor state changes and timing for speed/direction calculation
+    static int lastHallSensorValue = HIGH;      // Previous state of primary hall sensor
+    static int lastHallSensorValue2 = HIGH;     // Previous state of secondary hall sensor
+    static unsigned long hall1TriggerTime = 0;  // Timestamp when hall sensor 1 triggered
+    static unsigned long hall2TriggerTime = 0;  // Timestamp when hall sensor 2 triggered
+    static bool hall1Triggered = false;         // Flag: hall sensor 1 has triggered in current sequence
+    static bool hall2Triggered = false;         // Flag: hall sensor 2 has triggered in current sequence
+    static unsigned long lastTriggerTime = 0;   // Last trigger time for speed calculation
 
     lastTriggerTime = millis();
     xLastWakeTime = xTaskGetTickCount();
@@ -445,7 +584,16 @@ void hallSensorTask(void *pvParameters) {
 }
 
 //------------------------------------------------------------------------------
-// Task: Read Potentiometers and Update Thresholds
+// POTENTIOMETER TUNING TASK: Real-time Threshold Adjustment
+//
+// Purpose: Continuously reads three potentiometers to allow real-time tuning of:
+//          - Jump detection threshold (g-force level for takeoff detection)
+//          - Landing detection threshold (g-force level for landing detection)  
+//          - Drop detection threshold (g-force level for impact detection)
+//
+// Frequency: ~10Hz (100ms cycle time)
+// Priority: 2 (Low - non-critical background tuning)
+// Core: 1
 //------------------------------------------------------------------------------
 void potTuningTask(void *pvParameters) {
     Serial.println("potTuningTask started");
@@ -492,7 +640,17 @@ void potTuningTask(void *pvParameters) {
 }
 
 //------------------------------------------------------------------------------
-// Task: Process Data, Detect Events, Handle Button
+// PROCESSING TASK: Event Detection & User Input Handling  
+//
+// Purpose: Core logic task that:
+//          - Detects jump/drop/180° spin events using IMU data and thresholds
+//          - Handles zero button presses for IMU calibration
+//          - Calculates IMU-based direction and speed state
+//          - Manages event timing and display duration
+//
+// Frequency: ~33Hz (30ms cycle time)
+// Priority: 3 (Medium-High - main application logic)
+// Core: 1
 //------------------------------------------------------------------------------
 void processingTask(void *pvParameters) {
     Serial.println("processingTask started");
@@ -717,7 +875,17 @@ void processingTask(void *pvParameters) {
 }
 
 //------------------------------------------------------------------------------
-// Task: Handle BLE Notifications
+// BLE COMMUNICATION TASK: Wireless Data Transmission
+//
+// Purpose: Manages Bluetooth Low Energy communication by:
+//          - Sending sensor data (speed, orientation, g-force) to connected devices
+//          - Transmitting event notifications (jump/drop/180° detections)
+//          - Applying calibration offsets to orientation data
+//          - Managing connection state and notifications
+//
+// Frequency: ~10Hz (100ms cycle time)
+// Priority: 2 (Low-Medium - communication can tolerate some latency)
+// Core: 1
 //------------------------------------------------------------------------------
 void bleTask(void *pvParameters) {
     Serial.println("bleTask started");
@@ -801,7 +969,17 @@ void bleTask(void *pvParameters) {
 
 
 //------------------------------------------------------------------------------
-// Task: Update OLED Display
+// DISPLAY TASK: OLED Screen Updates
+//
+// Purpose: Updates the 128x64 OLED display with real-time information:
+//          - Current sensor readings (g-force, angle, speed, direction)
+//          - Event status indicators (jump, drop, 180° spin)
+//          - Threshold values from potentiometers
+//          - BLE connection status
+//
+// Frequency: ~6-7Hz (150ms cycle time)
+// Priority: 1 (Lowest - display updates are not time-critical)
+// Core: 1
 //------------------------------------------------------------------------------
 void displayTask(void *pvParameters) {
     Serial.println("displayTask started");
@@ -885,7 +1063,14 @@ void displayTask(void *pvParameters) {
 
 
 //==============================================================================
-// SETUP FUNCTION
+// SETUP FUNCTION: System Initialization
+// 
+// Purpose: One-time initialization of all system components:
+//          - Hardware pins (sensors, buttons, LEDs)
+//          - I2C communication and OLED display
+//          - BLE server and characteristics
+//          - FreeRTOS mutexes and tasks
+//          - ADC configuration for potentiometers
 //==============================================================================
 void setup() {
     Serial.begin(115200);
@@ -985,8 +1170,11 @@ void setup() {
 }
 
 //==============================================================================
-// LOOP FUNCTION (Empty)
+// LOOP FUNCTION: FreeRTOS Compatibility
+//
+// Purpose: Arduino's main loop function - kept minimal since all functionality
+//          is handled by FreeRTOS tasks. Simply delays to yield CPU time to tasks.
 //==============================================================================
 void loop() {
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      vTaskDelay(pdMS_TO_TICKS(1000));  // Yield to FreeRTOS scheduler
 }

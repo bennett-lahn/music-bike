@@ -1,3 +1,8 @@
+// WARNING: THIS FILE IS DEPRECATED.
+// Bike_Sensor_Filtered_IMU.ino is the only up to date code for the embedded platform
+// This file is kept for reference only. It attempts to implement a Kalman Filter to reduce IMU noise.
+// It also adds correction for yaw drift.
+
 // =============================================================================
 // HARDWARE ADJUSTMENT NOTES (As of 2025-05-04)
 // =============================================================================
@@ -13,6 +18,33 @@
 //    - Reason: To stabilize the supply voltage during high current demands
 //      at startup (especially from the radio), improving boot reliability
 //      and preventing potential resets when running on battery power.
+//
+// =============================================================================
+
+// =============================================================================
+// SENSOR FUSION IMPLEMENTATION NOTES
+// =============================================================================
+//
+// This implementation uses the Mahony AHRS filter with magnetometer integration
+// for robust 9-axis sensor fusion. The system combines:
+//
+// - MPU9250 accelerometer and gyroscope (6-axis)
+// - AK8963 magnetometer (3-axis) for yaw drift correction
+// - Mahony filter for quaternion-based orientation estimation
+// - Kalman filter for additional smoothing and state estimation
+//
+// BENEFITS OF THIS APPROACH:
+// - No external dependencies (self-contained implementation)
+// - Magnetometer prevents yaw drift common in gyro-only systems
+// - Proven Mahony algorithm with good performance characteristics
+// - Full control over filter parameters and behavior
+// - Compatible with existing Kalman filter integration
+//
+// MAGNETOMETER INTEGRATION:
+// - Factory calibration automatically read from AK8963
+// - Continuous 100Hz measurement mode
+// - Tilt compensation for accurate heading
+// - Dual error correction (gravity + magnetic field)
 //
 // =============================================================================
 
@@ -59,7 +91,7 @@ float dropThreshold = 2.5;      // gForce check (> threshold spike for drop)
 
 // Rolling average size
 #define AVG_SIZE 50
-#define THRESHOLD 5.0f
+#define THRESHOLD 2.0f
 
 //Define tunable ranges for potentiometers
 #define JUMP_THRESH_MIN 0.1f
@@ -75,7 +107,7 @@ float dropThreshold = 2.5;      // gForce check (> threshold spike for drop)
 #define IMU_DIRECTION_ACCEL_THRESHOLD 0.3 // Threshold for IMU-based direction change (+/- this value)
 
 // Kalman Filter Confidence Threshold
-#define KALMAN_VARIANCE_THRESHOLD 0.1f // If variance is above this, EMA might be preferred
+#define KALMAN_VARIANCE_THRESHOLD 1.0f // If variance is above this, EMA might be preferred (increased from 0.1f)
 
 // Physical constants
 #define WHEEL_DIAMETER_INCHES 26.0
@@ -92,6 +124,34 @@ const unsigned long directionDetectionTimeout = 500; // ms timeout to reset hall
 #define MPU9250_ADDRESS 0x68
 #define ACCEL_XOUT_H 0x3B
 #define GYRO_XOUT_H 0x43
+#define MPU9250_USER_CTRL 0x6A
+#define MPU9250_INT_PIN_CFG 0x37
+
+// AK8963 Magnetometer registers (accessed through MPU9250)
+#define AK8963_ADDRESS 0x0C
+#define AK8963_WHO_AM_I 0x00
+#define AK8963_INFO 0x01
+#define AK8963_ST1 0x02
+#define AK8963_XOUT_L 0x03
+#define AK8963_XOUT_H 0x04
+#define AK8963_YOUT_L 0x05
+#define AK8963_YOUT_H 0x06
+#define AK8963_ZOUT_L 0x07
+#define AK8963_ZOUT_H 0x08
+#define AK8963_ST2 0x09
+#define AK8963_CNTL 0x0A
+#define AK8963_ASTC 0x0C
+#define AK8963_I2CDIS 0x0F
+#define AK8963_ASAX 0x10
+#define AK8963_ASAY 0x11
+#define AK8963_ASAZ 0x12
+
+// MPU9250 I2C Master registers for magnetometer access
+#define MPU9250_I2C_MST_CTRL 0x24
+#define MPU9250_I2C_SLV0_ADDR 0x25
+#define MPU9250_I2C_SLV0_REG 0x26
+#define MPU9250_I2C_SLV0_CTRL 0x27
+#define MPU9250_EXT_SENS_DATA_00 0x49
 
 // Display settings
 #define SCREEN_WIDTH 128
@@ -128,29 +188,30 @@ SemaphoreHandle_t eventDataMutex = NULL;
 SemaphoreHandle_t offsetMutex = NULL;
 SemaphoreHandle_t bleConnectionMutex = NULL; // Protect deviceConnected flag
 SemaphoreHandle_t configMutex = NULL; // Mutex for tunable config variables
+SemaphoreHandle_t i2cMutex = NULL; // Mutex for I2C bus access
 
 // --- IMU Data (Protected by imuDataMutex) ---
-// Average over 10 readings
-float pitch[AVG_SIZE], roll[AVG_SIZE], yaw[AVG_SIZE];
+// EMA values
 float pitchAvg = 0.0, rollAvg = 0.0, yawAvg = 0.0;
-float gForce[AVG_SIZE]; 
 float gForceAvg = 1.0; // Initialize to 1g
 
 // Kalman Filtered Data (also protected by imuDataMutex)
 float kalmanPitchDeg = 0.0f;
 float kalmanRollDeg = 0.0f;
+float kalmanYawDeg = 0.0f;
 float kalmanPitchVariance = 1.0f; // Initialize with high uncertainty
 float kalmanRollVariance = 1.0f;  // Initialize with high uncertainty
+float kalmanYawVariance = 1.0f;   // Initialize with high uncertainty
 
 float accelX = 0.0, accelY = 0.0, accelZ = 0.0; // Raw scaled accel
 float gyroX = 0.0, gyroY = 0.0, gyroZ = 0.0;   // Raw scaled gyro
+float magX = 0.0, magY = 0.0, magZ = 0.0;      // Raw scaled magnetometer
 
 // --- Orientation Offsets (Protected by offsetMutex) ---
 float pitchOffset = 0.0, rollOffset = 0.0, yawOffset = 0.0;
 
 // --- Hall Sensor Data (Protected by hallDataMutex) ---
-float currentSpeed[AVG_SIZE];          // km/h
-float currentSpeedAvg = 0.0;
+float currentSpeedAvg = 0.0; // EMA value
 bool hallDirectionForward = true;
 int hallSensorValue = HIGH;       // Current raw value
 int hallSensorValue2 = HIGH;      // Current raw value 2
@@ -189,6 +250,9 @@ TaskHandle_t bleTaskHandle = NULL;
 TaskHandle_t displayTaskHandle = NULL;
 TaskHandle_t potTuningTaskHandle = NULL;
 
+// Magnetometer calibration values (factory calibration from AK8963)
+float magCalX = 1.0f, magCalY = 1.0f, magCalZ = 1.0f;
+
 //==============================================================================
 // KALMAN FILTER CLASS DEFINITION
 //==============================================================================
@@ -210,153 +274,187 @@ public:
         R_angle = r_angle;
         R_speed = r_speed;
 
-        // Initialize state vector [pitch, roll, pitch_rate, roll_rate, speed, speed_rate]
+        // Initialize state vector [pitch, roll, yaw, pitch_rate, roll_rate, yaw_rate, speed, speed_rate]
         x[0] = 0.0f;  // pitch
         x[1] = 0.0f;  // roll
-        x[2] = 0.0f;  // pitch_rate
-        x[3] = 0.0f;  // roll_rate
-        x[4] = 0.0f;  // speed
-        x[5] = 0.0f;  // speed_rate
+        x[2] = 0.0f;  // yaw
+        x[3] = 0.0f;  // pitch_rate
+        x[4] = 0.0f;  // roll_rate
+        x[5] = 0.0f;  // yaw_rate
+        x[6] = 0.0f;  // speed
+        x[7] = 0.0f;  // speed_rate
 
         // Initialize covariance matrix P
         // Start with high uncertainty
-        for(int i = 0; i < 6; i++) {
-            for(int j = 0; j < 6; j++) {
+        for(int i = 0; i < 8; i++) {
+            for(int j = 0; j < 8; j++) {
                 P[i][j] = (i == j) ? 1.0f : 0.0f;
             }
         }
     }
 
     // Predict step: call with gyro rates (rad/s), acceleration (m/s^2), and time step dt (s)
-    void predict(float gyro_pitch_rate, float gyro_roll_rate, float acceleration, float dt) {
-        // State transition matrix F
-        float F[6][6] = {
-            {1.0f, 0.0f, dt, 0.0f, 0.0f, 0.0f},
-            {0.0f, 1.0f, 0.0f, dt, 0.0f, 0.0f},
-            {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f},
-            {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f},
-            {0.0f, 0.0f, 0.0f, 0.0f, 1.0f, dt},
-            {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f}
+    void predict(float gyro_pitch_rate, float gyro_roll_rate, float gyro_yaw_rate, float acceleration, float dt) {
+        // State transition matrix F (8x8)
+        float F[8][8] = {
+            {1.0f, 0.0f, 0.0f, dt, 0.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 1.0f, 0.0f, 0.0f, dt, 0.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, dt, 0.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, dt},
+            {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f}
         };
 
-        // Process noise matrix Q
-        float Q[6][6] = {
-            {Q_angle, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
-            {0.0f, Q_angle, 0.0f, 0.0f, 0.0f, 0.0f},
-            {0.0f, 0.0f, Q_rate, 0.0f, 0.0f, 0.0f},
-            {0.0f, 0.0f, 0.0f, Q_rate, 0.0f, 0.0f},
-            {0.0f, 0.0f, 0.0f, 0.0f, Q_speed, 0.0f},
-            {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, Q_speed}
+        // Process noise matrix Q (8x8)
+        float Q[8][8] = {
+            {Q_angle, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, Q_angle, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, Q_angle, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, Q_rate, 0.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, 0.0f, Q_rate, 0.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, Q_rate, 0.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, Q_speed, 0.0f},
+            {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, Q_speed}
         };
 
         // Predict state
-        float x_new[6];
-        for(int i = 0; i < 6; i++) {
+        float x_new[8];
+        for(int i = 0; i < 8; i++) {
             x_new[i] = 0.0f;
-            for(int j = 0; j < 6; j++) {
+            for(int j = 0; j < 8; j++) {
                 x_new[i] += F[i][j] * x[j];
             }
         }
 
         // Add control inputs
-        x_new[2] = gyro_pitch_rate;  // Update pitch rate from gyro
-        x_new[3] = gyro_roll_rate;   // Update roll rate from gyro
-        x_new[5] = acceleration;     // Update speed rate from acceleration
+        x_new[3] = gyro_pitch_rate;  // Update pitch rate from gyro
+        x_new[4] = gyro_roll_rate;   // Update roll rate from gyro
+        x_new[5] = gyro_yaw_rate;    // Update yaw rate from gyro
+        x_new[7] = acceleration;     // Update speed rate from acceleration
 
         // Predict covariance
-        float P_new[6][6];
-        for(int i = 0; i < 6; i++) {
-            for(int j = 0; j < 6; j++) {
+        float P_new[8][8];
+        for(int i = 0; i < 8; i++) {
+            for(int j = 0; j < 8; j++) {
                 P_new[i][j] = 0.0f;
-                for(int k = 0; k < 6; k++) {
+                for(int k = 0; k < 8; k++) {
                     P_new[i][j] += F[i][k] * P[k][j];
                 }
             }
         }
 
         // Add process noise
-        for(int i = 0; i < 6; i++) {
-            for(int j = 0; j < 6; j++) {
+        for(int i = 0; i < 8; i++) {
+            for(int j = 0; j < 8; j++) {
                 P_new[i][j] += Q[i][j];
             }
         }
 
         // Update state and covariance
-        for(int i = 0; i < 6; i++) {
+        for(int i = 0; i < 8; i++) {
             x[i] = x_new[i];
-            for(int j = 0; j < 6; j++) {
+            for(int j = 0; j < 8; j++) {
                 P[i][j] = P_new[i][j];
             }
         }
     }
 
     // Update step: call with measured angles (rad) and speed (m/s)
-    void update(float measured_pitch, float measured_roll, float measured_speed) {
-        // Measurement matrix H
-        float H[3][6] = {
-            {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},  // pitch measurement
-            {0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f},  // roll measurement
-            {0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f}   // speed measurement
+    void update(float measured_pitch, float measured_roll, float measured_yaw, float measured_speed) {
+        // Measurement matrix H (4x8)
+        float H[4][8] = {
+            {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},  // pitch measurement
+            {0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},  // roll measurement
+            {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},  // yaw measurement
+            {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f}   // speed measurement
         };
 
-        // Measurement noise matrix R
-        float R[3][3] = {
-            {R_angle, 0.0f, 0.0f},
-            {0.0f, R_angle, 0.0f},
-            {0.0f, 0.0f, R_speed}
+        // Measurement noise matrix R (4x4)
+        float R[4][4] = {
+            {R_angle, 0.0f, 0.0f, 0.0f},
+            {0.0f, R_angle, 0.0f, 0.0f},
+            {0.0f, 0.0f, R_angle, 0.0f},
+            {0.0f, 0.0f, 0.0f, R_speed}
         };
 
         // Innovation
-        float y[3] = {
+        float y[4] = {
             measured_pitch - x[0],
             measured_roll - x[1],
-            measured_speed - x[4]
+            measured_yaw - x[2],
+            measured_speed - x[6]
         };
 
-        // Innovation covariance
-        float S[3][3];
-        for(int i = 0; i < 3; i++) {
-            for(int j = 0; j < 3; j++) {
+        // Innovation covariance S = H*P*H' + R (4x4)
+        float S[4][4];
+        for(int i = 0; i < 4; i++) {
+            for(int j = 0; j < 4; j++) {
                 S[i][j] = R[i][j];
-                for(int k = 0; k < 6; k++) {
-                    S[i][j] += H[i][k] * P[k][j];
+                for(int k = 0; k < 8; k++) {
+                    for(int l = 0; l < 8; l++) {
+                        S[i][j] += H[i][k] * P[k][l] * H[j][l];
+                    }
                 }
             }
         }
 
-        // Kalman gain
-        float K[6][3];
-        for(int i = 0; i < 6; i++) {
-            for(int j = 0; j < 3; j++) {
+        // Invert S matrix (simplified for 4x4 diagonal-dominant case)
+        float S_inv[4][4];
+        for(int i = 0; i < 4; i++) {
+            for(int j = 0; j < 4; j++) {
+                S_inv[i][j] = (i == j) ? (1.0f / S[i][i]) : 0.0f;
+            }
+        }
+
+        // Kalman gain K = P*H'*S_inv (8x4)
+        float K[8][4];
+        for(int i = 0; i < 8; i++) {
+            for(int j = 0; j < 4; j++) {
                 K[i][j] = 0.0f;
-                for(int k = 0; k < 6; k++) {
-                    K[i][j] += P[i][k] * H[j][k];
+                for(int k = 0; k < 8; k++) {
+                    for(int l = 0; l < 4; l++) {
+                        K[i][j] += P[i][k] * H[l][k] * S_inv[l][j];
+                    }
                 }
-                K[i][j] /= S[j][j];
             }
         }
 
         // Update state
-        for(int i = 0; i < 6; i++) {
-            for(int j = 0; j < 3; j++) {
+        for(int i = 0; i < 8; i++) {
+            for(int j = 0; j < 4; j++) {
                 x[i] += K[i][j] * y[j];
             }
         }
 
-        // Update covariance
-        float P_new[6][6];
-        for(int i = 0; i < 6; i++) {
-            for(int j = 0; j < 6; j++) {
-                P_new[i][j] = P[i][j];
-                for(int k = 0; k < 3; k++) {
-                    P_new[i][j] -= K[i][k] * S[k][k] * K[j][k];
+        // Update covariance P = (I - K*H)*P
+        float P_new[8][8];
+        float I_KH[8][8];
+        
+        // Calculate I - K*H
+        for(int i = 0; i < 8; i++) {
+            for(int j = 0; j < 8; j++) {
+                I_KH[i][j] = (i == j) ? 1.0f : 0.0f; // Identity matrix
+                for(int k = 0; k < 4; k++) {
+                    I_KH[i][j] -= K[i][k] * H[k][j];
+                }
+            }
+        }
+        
+        // P_new = (I - K*H) * P
+        for(int i = 0; i < 8; i++) {
+            for(int j = 0; j < 8; j++) {
+                P_new[i][j] = 0.0f;
+                for(int k = 0; k < 8; k++) {
+                    P_new[i][j] += I_KH[i][k] * P[k][j];
                 }
             }
         }
 
         // Update covariance matrix
-        for(int i = 0; i < 6; i++) {
-            for(int j = 0; j < 6; j++) {
+        for(int i = 0; i < 8; i++) {
+            for(int j = 0; j < 8; j++) {
                 P[i][j] = P_new[i][j];
             }
         }
@@ -365,21 +463,31 @@ public:
     // Getters
     float getPitchRad() { return x[0]; }
     float getRollRad() { return x[1]; }
-    float getPitchRateRadS() { return x[2]; }
-    float getRollRateRadS() { return x[3]; }
-    float getSpeedMS() { return x[4]; }
-    float getSpeedRateMS2() { return x[5]; }
+    float getYawRad() { return x[2]; }
+    float getPitchRateRadS() { return x[3]; }
+    float getRollRateRadS() { return x[4]; }
+    float getYawRateRadS() { return x[5]; }
+    float getSpeedMS() { return x[6]; }
+    float getSpeedRateMS2() { return x[7]; }
 
     float getPitchDeg() { return x[0] * 180.0f / M_PI; }
     float getRollDeg() { return x[1] * 180.0f / M_PI; }
-    float getPitchRateDegS() { return x[2] * 180.0f / M_PI; }
-    float getRollRateDegS() { return x[3] * 180.0f / M_PI; }
-    float getSpeedKMH() { return x[4] * 3.6f; }
+    float getYawDeg() { 
+        float yaw_deg = x[2] * 180.0f / M_PI; 
+        while (yaw_deg < 0.0f) yaw_deg += 360.0f;
+        while (yaw_deg >= 360.0f) yaw_deg -= 360.0f;
+        return yaw_deg;
+    }
+    float getPitchRateDegS() { return x[3] * 180.0f / M_PI; }
+    float getRollRateDegS() { return x[4] * 180.0f / M_PI; }
+    float getYawRateDegS() { return x[5] * 180.0f / M_PI; }
+    float getSpeedKMH() { return x[6] * 3.6f; }
 
     // Get variance of estimates
     float getPitchVariance() { return P[0][0]; }
     float getRollVariance() { return P[1][1]; }
-    float getSpeedVariance() { return P[4][4]; }
+    float getYawVariance() { return P[2][2]; }
+    float getSpeedVariance() { return P[6][6]; }
 
 private:
     float Q_angle;    // Process noise variance for angles
@@ -388,18 +496,18 @@ private:
     float R_angle;    // Measurement noise variance for angles
     float R_speed;    // Measurement noise variance for speed
 
-    float x[6];       // State vector
-    float P[6][6];    // Covariance matrix
+    float x[8];       // State vector
+    float P[8][8];    // Covariance matrix
 };
 
 // --- Kalman Filter Instances ---
 // Tunable parameters for the Kalman filters
-// Q_angle: Process noise for angles (0.001f)
-// Q_rate: Process noise for rates (0.003f)
+// Q_angle: Process noise for angles (increased for more responsiveness)
+// Q_rate: Process noise for rates (increased for more responsiveness)
 // Q_speed: Process noise for speed (0.01f)
-// R_angle: Measurement noise for angles (0.03f)
+// R_angle: Measurement noise for angles (decreased for more trust in measurements)
 // R_speed: Measurement noise for speed (0.1f)
-KalmanFilter kalmanFilter(0.001f, 0.003f, 0.01f, 0.03f, 0.1f);
+KalmanFilter kalmanFilter(0.01f, 0.01f, 0.01f, 0.01f, 0.1f);
 
 //==============================================================================
 // BLE CALLBACK CLASS
@@ -436,22 +544,52 @@ class AccelerometerZeroCallbacks: public BLECharacteristicCallbacks {
             if (value[0] != 0) {
                 Serial.println(">>> BLE Zero Command Received!");
                 
-                // Get current orientation values
-                float current_raw_pitch = 0.0, current_raw_roll = 0.0, current_raw_yaw = 0.0;
+                // Get current orientation values using the same logic as BLE task
+                float current_pitch = 0.0, current_roll = 0.0, current_yaw = 0.0;
                 
                 if (xSemaphoreTake(imuDataMutex, portMAX_DELAY) == pdTRUE) {
-                    current_raw_pitch = pitchAvg;
-                    current_raw_roll = rollAvg;
-                    current_raw_yaw = yawAvg;
+                    // Use the same selection logic as the BLE task
+                    float ema_pitch = pitchAvg;
+                    float ema_roll = rollAvg;
+                    float ema_yaw = yawAvg;
+                    
+                    float kf_pitch = kalmanPitchDeg;
+                    float kf_roll = kalmanRollDeg;
+                    float kf_yaw = kalmanYawDeg;
+                    float kf_pitch_variance = kalmanPitchVariance;
+                    float kf_roll_variance = kalmanRollVariance;
+                    float kf_yaw_variance = kalmanYawVariance;
+                    
+                    // Use the same variance-based selection as BLE task
+                    if (kf_pitch_variance < KALMAN_VARIANCE_THRESHOLD) {
+                        current_pitch = kf_pitch; // Use Kalman pitch
+                    } else {
+                        current_pitch = ema_pitch; // Use EMA pitch
+                    }
+                    
+                    if (kf_roll_variance < KALMAN_VARIANCE_THRESHOLD) {
+                        current_roll = kf_roll; // Use Kalman roll
+                    } else {
+                        current_roll = ema_roll; // Use EMA roll
+                    }
+                    
+                    if (kf_yaw_variance < KALMAN_VARIANCE_THRESHOLD) {
+                        current_yaw = kf_yaw; // Use Kalman yaw
+                    } else {
+                        current_yaw = ema_yaw; // Use EMA yaw
+                    }
+                    
                     xSemaphoreGive(imuDataMutex);
                     
                     // Update offsets
                     if (xSemaphoreTake(offsetMutex, portMAX_DELAY) == pdTRUE) {
-                        pitchOffset = current_raw_pitch;
-                        rollOffset = current_raw_roll;
-                        yawOffset = current_raw_yaw;
+                        pitchOffset = current_pitch;
+                        rollOffset = current_roll;
+                        yawOffset = current_yaw;
                         xSemaphoreGive(offsetMutex);
                         Serial.println(">>> BLE Zero: SUCCESS - Zero position offsets updated!");
+                        Serial.printf(">>> BLE Zero: New offsets - P:%.2f R:%.2f Y:%.2f\n", 
+                                     pitchOffset, rollOffset, yawOffset);
                     }
                 }
             }
@@ -463,30 +601,147 @@ class AccelerometerZeroCallbacks: public BLECharacteristicCallbacks {
 // HELPER FUNCTIONS
 //==============================================================================
 
-// Updates array of rolling average and returns new rolling average value
-float updateRollingAverage(float array[], float newVal) {
+// Apply magnetometer correction to yaw
+float correctYawWithMagnetometer(float dmpYaw, float mx, float my, float mz, float pitch, float roll) {
+    // Tilt compensation for magnetometer
+    float magX_comp = mx * cos(pitch) + mz * sin(pitch);
+    float magY_comp = mx * sin(roll) * sin(pitch) + my * cos(roll) - mz * sin(roll) * cos(pitch);
+    
+    // Calculate magnetic heading
+    float magHeading = atan2(magY_comp, magX_comp);
+    if (magHeading < 0) magHeading += 2 * M_PI;
+    
+    // Simple complementary filter between DMP yaw and magnetometer heading
+    // Adjust the weight (0.02) based on your needs - lower values trust DMP more
+    float correctedYaw = 0.98f * dmpYaw + 0.02f * magHeading;
+    
+    return correctedYaw;
+}
+
+// Initialize AK8963 magnetometer
+void initMagnetometer() {
+    Serial.println("Initializing magnetometer...");
+    
+    // Enable I2C master mode
+    Wire.beginTransmission(MPU9250_ADDRESS);
+    Wire.write(MPU9250_USER_CTRL);
+    Wire.write(0x20); // Enable I2C master mode
+    Wire.endTransmission();
+    
+    // Set I2C master clock to 400kHz
+    Wire.beginTransmission(MPU9250_ADDRESS);
+    Wire.write(MPU9250_I2C_MST_CTRL);
+    Wire.write(0x0D); // I2C master clock 400kHz
+    Wire.endTransmission();
+    
+    // Enable bypass mode to access magnetometer directly first
+    Wire.beginTransmission(MPU9250_ADDRESS);
+    Wire.write(MPU9250_INT_PIN_CFG);
+    Wire.write(0x02); // Enable I2C bypass
+    Wire.endTransmission();
+    
+    delay(100);
+    
+    // Check magnetometer WHO_AM_I
+    Wire.beginTransmission(AK8963_ADDRESS);
+    Wire.write(AK8963_WHO_AM_I);
+    Wire.endTransmission(false);
+    Wire.requestFrom(AK8963_ADDRESS, 1, true);
+    uint8_t whoami = Wire.read();
+    Serial.printf("Magnetometer WHO_AM_I: 0x%02X (should be 0x48)\n", whoami);
+    
+    // Read factory calibration values
+    Wire.beginTransmission(AK8963_ADDRESS);
+    Wire.write(AK8963_ASAX);
+    Wire.endTransmission(false);
+    Wire.requestFrom(AK8963_ADDRESS, 3, true);
+    uint8_t asax = Wire.read();
+    uint8_t asay = Wire.read();
+    uint8_t asaz = Wire.read();
+    
+    // Calculate calibration multipliers
+    magCalX = (float)(asax - 128) / 256.0f + 1.0f;
+    magCalY = (float)(asay - 128) / 256.0f + 1.0f;
+    magCalZ = (float)(asaz - 128) / 256.0f + 1.0f;
+    
+    Serial.printf("Mag calibration: X=%.3f, Y=%.3f, Z=%.3f\n", magCalX, magCalY, magCalZ);
+    
+    // Set magnetometer to power down mode
+    Wire.beginTransmission(AK8963_ADDRESS);
+    Wire.write(AK8963_CNTL);
+    Wire.write(0x00);
+    Wire.endTransmission();
+    delay(10);
+    
+    // Set magnetometer to continuous measurement mode 2 (100Hz)
+    Wire.beginTransmission(AK8963_ADDRESS);
+    Wire.write(AK8963_CNTL);
+    Wire.write(0x16); // 16-bit output, continuous mode 2
+    Wire.endTransmission();
+    delay(10);
+    
+    // Disable bypass mode and use I2C master
+    Wire.beginTransmission(MPU9250_ADDRESS);
+    Wire.write(MPU9250_INT_PIN_CFG);
+    Wire.write(0x00); // Disable I2C bypass
+    Wire.endTransmission();
+    
+    // Set up automatic magnetometer reading via I2C master
+    // Read 7 bytes starting from ST1 (includes ST1, X, Y, Z, ST2)
+    Wire.beginTransmission(MPU9250_ADDRESS);
+    Wire.write(MPU9250_I2C_SLV0_ADDR);
+    Wire.write(AK8963_ADDRESS | 0x80); // Read from AK8963
+    Wire.endTransmission();
+    
+    Wire.beginTransmission(MPU9250_ADDRESS);
+    Wire.write(MPU9250_I2C_SLV0_REG);
+    Wire.write(AK8963_ST1); // Start reading from ST1
+    Wire.endTransmission();
+    
+    Wire.beginTransmission(MPU9250_ADDRESS);
+    Wire.write(MPU9250_I2C_SLV0_CTRL);
+    Wire.write(0x87); // Enable and read 7 bytes
+    Wire.endTransmission();
+    
+    Serial.println("Magnetometer initialized successfully!");
+}
+
+// Read magnetometer data
+void readMagnetometer(float &mx, float &my, float &mz) {
+    // Read magnetometer data from external sensor data registers
+    Wire.beginTransmission(MPU9250_ADDRESS);
+    Wire.write(MPU9250_EXT_SENS_DATA_00);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU9250_ADDRESS, 7, true);
+    
+    uint8_t st1 = Wire.read(); // Status 1
+    int16_t raw_mx = Wire.read() | (Wire.read() << 8); // X LSB, X MSB
+    int16_t raw_my = Wire.read() | (Wire.read() << 8); // Y LSB, Y MSB
+    int16_t raw_mz = Wire.read() | (Wire.read() << 8); // Z LSB, Z MSB
+    uint8_t st2 = Wire.read(); // Status 2
+    
+    // Check if data is ready and not overrun
+    if ((st1 & 0x01) && !(st2 & 0x08)) {
+        // Apply factory calibration and convert to µT (microTesla)
+        // AK8963 sensitivity: 0.15 µT/LSB for 16-bit mode
+        mx = (float)raw_mx * 0.15f * magCalX;
+        my = (float)raw_my * 0.15f * magCalY;
+        mz = (float)raw_mz * 0.15f * magCalZ;
+    }
+    // If data not ready or overrun, keep previous values
+}
+
+// Simple EMA (Exponential Moving Average) calculation with spike rejection
+float updateEMA(float previousEMA, float newVal) {
     float alpha = 2.0f / (AVG_SIZE + 1);
     
-    // Calculate current average
-    float currentAvg = 0.0f;
-    for (int i = 0; i < AVG_SIZE; i++) {
-        currentAvg += array[i];
+    // Spike rejection: if newVal deviates too much from previous EMA, ignore it
+    if (fabs(newVal - previousEMA) > THRESHOLD) {
+        newVal = previousEMA;
     }
-    currentAvg /= AVG_SIZE;
-
-    // Spike rejection: if newVal deviates too much, ignore it
-    if (fabs(newVal - currentAvg) > THRESHOLD) {
-        newVal = currentAvg;
-    }
-    float newEMA = alpha * newVal + (1 - alpha) * array[AVG_SIZE - 1];
-
-    // Shift array and update last value
-    for (int i = 0; i < AVG_SIZE - 1; i++) {
-        array[i] = array[i + 1];
-    }
-    array[AVG_SIZE - 1] = newEMA;
-
-    return newEMA;
+    
+    // Calculate new EMA: EMA = α * newValue + (1 - α) * previousEMA
+    return alpha * newVal + (1.0f - alpha) * previousEMA;
 }
 
 //==============================================================================
@@ -494,7 +749,7 @@ float updateRollingAverage(float array[], float newVal) {
 //==============================================================================
 
 //------------------------------------------------------------------------------
-// Task: Read MPU9250 and Calculate Orientation
+// Task: Read MPU9250 and Calculate Orientation (Mahony Filter + Magnetometer)
 //------------------------------------------------------------------------------
 void imuTask(void *pvParameters) {
     Serial.println("imuTask started");
@@ -509,24 +764,43 @@ void imuTask(void *pvParameters) {
     static float integralFBx = 0, integralFBy = 0, integralFBz = 0;
 
     // Initialize MPU9250 communication here
-    Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true); // Wake up
-    Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1C); Wire.write(0x00); Wire.endTransmission(true); // Accel +/- 2g
-    Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1B); Wire.write(0x00); Wire.endTransmission(true); // Gyro +/- 250dps
-Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1A); Wire.write(0x03); Wire.endTransmission(true); // Digital low-pass filter for Accel/Gyro, ~20Hz BW
+    if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
+        Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true); // Wake up
+        Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1C); Wire.write(0x00); Wire.endTransmission(true); // Accel +/- 2g
+        Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1B); Wire.write(0x00); Wire.endTransmission(true); // Gyro +/- 250dps
+        Wire.beginTransmission(MPU9250_ADDRESS);  Wire.write(0x1A); Wire.write(0x04); Wire.endTransmission(true); // DLPF_CFG = 4 (gyroscope 20 Hz low pass filter)
+        Wire.beginTransmission(MPU9250_ADDRESS);  Wire.write(0x1D); Wire.write(0x04); Wire.endTransmission(true); // A_DLPF_CFG = 4 (accelerometer 20 Hz low pass filter) 
+        initMagnetometer();
+        xSemaphoreGive(i2cMutex);
+    }
+    
     lastQuatTime = micros();
     xLastWakeTime = xTaskGetTickCount();
 
     while (1) {
         // --- Read Raw Data ---
         int16_t raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz;
-        // Read Accel
-        Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(ACCEL_XOUT_H); Wire.endTransmission(false);
-        Wire.requestFrom(MPU9250_ADDRESS, 6, true);
-        raw_ax = Wire.read() << 8 | Wire.read(); raw_ay = Wire.read() << 8 | Wire.read(); raw_az = Wire.read() << 8 | Wire.read();
-        // Read Gyro
-        Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(GYRO_XOUT_H); Wire.endTransmission(false);
-        Wire.requestFrom(MPU9250_ADDRESS, 6, true);
-        raw_gx = Wire.read() << 8 | Wire.read(); raw_gy = Wire.read() << 8 | Wire.read(); raw_gz = Wire.read() << 8 | Wire.read();
+        float local_mx, local_my, local_mz;
+        
+        // Protect I2C operations with mutex
+        if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
+            // Read Accel
+            Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(ACCEL_XOUT_H); Wire.endTransmission(false);
+            Wire.requestFrom(MPU9250_ADDRESS, 6, true);
+            raw_ax = Wire.read() << 8 | Wire.read(); raw_ay = Wire.read() << 8 | Wire.read(); raw_az = Wire.read() << 8 | Wire.read();
+            // Read Gyro
+            Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(GYRO_XOUT_H); Wire.endTransmission(false);
+            Wire.requestFrom(MPU9250_ADDRESS, 6, true);
+            raw_gx = Wire.read() << 8 | Wire.read(); raw_gy = Wire.read() << 8 | Wire.read(); raw_gz = Wire.read() << 8 | Wire.read();
+
+            // Read magnetometer data
+            readMagnetometer(local_mx, local_my, local_mz);
+            xSemaphoreGive(i2cMutex);
+        } else {
+            // If we can't get the mutex, skip this cycle
+            vTaskDelayUntil(&xLastWakeTime, xFrequency);
+            continue;
+        }
 
         // --- Local calculation variables ---
         float local_ax = raw_ax / 16384.0f;
@@ -536,16 +810,18 @@ Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1A); Wire.write(0x03); Wir
         float local_gy = raw_gy / 131.0f;
         float local_gz = raw_gz / 131.0f;
 
-        // --- Calculate Angles (Mahony AHRS) ---
+        // --- Calculate Angles (Mahony AHRS with Magnetometer) ---
         unsigned long now = micros();
         float dt = (now - lastQuatTime) * 1e-6f; // Delta t in seconds
         lastQuatTime = now;
         if (dt <= 0) dt = 1e-3; // Prevent division by zero or negative dt
 
-        // (Mahony filter calculations remain the same)
+        // Convert to proper units and normalize
         float ax_calc = local_ax, ay_calc = local_ay, az_calc = local_az;
         float gx_calc = local_gx * PI/180.0f, gy_calc = local_gy * PI/180.0f, gz_calc = local_gz * PI/180.0f;
+        float mx_calc = local_mx, my_calc = local_my, mz_calc = local_mz;
 
+        // Normalize accelerometer measurement
         float norm = sqrt(ax_calc*ax_calc + ay_calc*ay_calc + az_calc*az_calc);
         if (norm > 0.0f) {
            ax_calc /= norm; ay_calc /= norm; az_calc /= norm;
@@ -553,8 +829,32 @@ Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1A); Wire.write(0x03); Wir
              ax_calc = 0; ay_calc = 0; az_calc = 0;
         }
 
-        float vx = 2.0f*(q1*q3 - q0*q2); float vy = 2.0f*(q0*q1 + q2*q3); float vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
-        float ex = (ay_calc*vz - az_calc*vy); float ey = (az_calc*vx - ax_calc*vz); float ez = (ax_calc*vy - ay_calc*vx);
+        // Normalize magnetometer measurement
+        norm = sqrt(mx_calc*mx_calc + my_calc*my_calc + mz_calc*mz_calc);
+        if (norm > 0.0f) {
+           mx_calc /= norm; my_calc /= norm; mz_calc /= norm;
+        } else {
+             mx_calc = 0; my_calc = 0; mz_calc = 0;
+        }
+
+        // Reference direction of Earth's magnetic field (normalized)
+        float hx = 2.0f * (mx_calc * (0.5f - q2*q2 - q3*q3) + my_calc * (q1*q2 - q0*q3) + mz_calc * (q1*q3 + q0*q2));
+        float hy = 2.0f * (mx_calc * (q1*q2 + q0*q3) + my_calc * (0.5f - q1*q1 - q3*q3) + mz_calc * (q2*q3 - q0*q1));
+        float bx = sqrt(hx*hx + hy*hy);
+        float bz = 2.0f * (mx_calc * (q1*q3 - q0*q2) + my_calc * (q2*q3 + q0*q1) + mz_calc * (0.5f - q1*q1 - q2*q2));
+
+        // Estimated direction of gravity and magnetic field
+        float vx = 2.0f*(q1*q3 - q0*q2);
+        float vy = 2.0f*(q0*q1 + q2*q3);
+        float vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
+        float wx = 2.0f*(bx*(0.5f - q2*q2 - q3*q3) + bz*(q1*q3 - q0*q2));
+        float wy = 2.0f*(bx*(q1*q2 - q0*q3) + bz*(q0*q1 + q2*q3));
+        float wz = 2.0f*(bx*(q0*q2 + q1*q3) + bz*(0.5f - q1*q1 - q2*q2));
+
+        // Error is sum of cross product between estimated direction and measured direction of field
+        float ex = (ay_calc*vz - az_calc*vy) + (my_calc*wz - mz_calc*wy);
+        float ey = (az_calc*vx - ax_calc*vz) + (mz_calc*wx - mx_calc*wz);
+        float ez = (ax_calc*vy - ay_calc*vx) + (mx_calc*wy - my_calc*wx);
 
         if (twoKi > 0.0f) {
            integralFBx += twoKi * ex * dt; integralFBy += twoKi * ey * dt; integralFBz += twoKi * ez * dt;
@@ -584,9 +884,14 @@ Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1A); Wire.write(0x03); Wir
         float local_gForce = verticalAcceleration;
 
         // --- Kalman Filter Update ---
-        // Calculate pitch and roll from accelerometer (in radians for Kalman filter)
-        float accel_pitch_rad = atan2(-local_ax, sqrt(local_ay * local_ay + local_az * local_az));
-        float accel_roll_rad  = atan2(local_ay, local_az);
+        // Use Mahony filter output as measurements (convert to radians for Kalman filter)
+        float mahony_pitch_rad = local_pitch * (M_PI / 180.0f);
+        float mahony_roll_rad = local_roll * (M_PI / 180.0f);
+        
+        // Handle yaw wrapping: convert to radians and normalize to [-π, π]
+        float mahony_yaw_rad = local_yaw * (M_PI / 180.0f);
+        while (mahony_yaw_rad > M_PI) mahony_yaw_rad -= 2.0f * M_PI;
+        while (mahony_yaw_rad < -M_PI) mahony_yaw_rad += 2.0f * M_PI;
 
         // Get current speed from hall sensors (convert km/h to m/s)
         float current_speed_ms = 0.0f;
@@ -595,62 +900,105 @@ Wire.beginTransmission(MPU9250_ADDRESS); Wire.write(0x1A); Wire.write(0x03); Wir
             xSemaphoreGive(hallDataMutex);
         }
 
-        // Calculate acceleration from IMU
+        // Calculate acceleration magnitude for speed estimation
         float acceleration = sqrt(local_ax * local_ax + local_ay * local_ay + local_az * local_az) - 1.0f; // Subtract 1g
 
         // Gyro rates in rad/s for Kalman filter
         float gyro_x_rad_s = local_gx * (M_PI / 180.0f); // Pitch rate
         float gyro_y_rad_s = local_gy * (M_PI / 180.0f); // Roll rate
-        // float gyro_z_rad_s = local_gz * (M_PI / 180.0f); // Yaw rate - not used by these Kalman filters
+        float gyro_z_rad_s = local_gz * (M_PI / 180.0f); // Yaw rate
 
         // Predict step (uses gyro rates and acceleration)
-        kalmanFilter.predict(gyro_x_rad_s, gyro_y_rad_s, acceleration, dt);
+        kalmanFilter.predict(gyro_x_rad_s, gyro_y_rad_s, gyro_z_rad_s, acceleration, dt);
 
-        // Update step (uses accelerometer-derived angles and hall sensor speed)
-        kalmanFilter.update(accel_pitch_rad, accel_roll_rad, current_speed_ms);
+        // Update step (uses Mahony filter output and hall sensor speed)
+        kalmanFilter.update(mahony_pitch_rad, mahony_roll_rad, mahony_yaw_rad, current_speed_ms);
 
         // Get filtered values
         float local_kalman_pitch_deg = kalmanFilter.getPitchDeg();
         float local_kalman_roll_deg = kalmanFilter.getRollDeg();
+        float local_kalman_yaw_deg = kalmanFilter.getYawDeg();
         float local_kalman_pitch_variance = kalmanFilter.getPitchVariance();
         float local_kalman_roll_variance = kalmanFilter.getRollVariance();
+        float local_kalman_yaw_variance = kalmanFilter.getYawVariance();
         float local_kalman_speed_kmh = kalmanFilter.getSpeedKMH();
 
-        // --- Update Shared Variables (Protected by Mutex) ---
-        if (xSemaphoreTake(imuDataMutex, portMAX_DELAY) == pdTRUE) {
-            pitchAvg = updateRollingAverage(pitch, local_pitch);
-            rollAvg = updateRollingAverage(roll, local_roll);
-            yawAvg = updateRollingAverage(yaw, local_yaw);
-            gForceAvg = updateRollingAverage(gForce, local_gForce);
-
-            // Store Kalman filtered values
-            kalmanPitchDeg = local_kalman_pitch_deg;
-            kalmanRollDeg = local_kalman_roll_deg;
-            kalmanPitchVariance = local_kalman_pitch_variance;
-            kalmanRollVariance = local_kalman_roll_variance;
-
-            // Update speed with Kalman filtered value if variance is low
-            if (kalmanFilter.getSpeedVariance() < KALMAN_VARIANCE_THRESHOLD) {
-                if (xSemaphoreTake(hallDataMutex, portMAX_DELAY) == pdTRUE) {
-                    // Update direction based on Kalman filter speed
-                    hallDirectionForward = (local_kalman_speed_kmh >= 0);
-                    currentSpeedAvg = abs(local_kalman_speed_kmh);
-                    xSemaphoreGive(hallDataMutex);
-                }
+        // Debug output every 100 cycles (~2 seconds at 50Hz)
+            static int debug_counter = 0;
+            debug_counter++;
+            if (debug_counter >= 100) {
+                debug_counter = 0;
+                Serial.printf("Kalman: P=%.2f(%.3f) R=%.2f(%.3f) Y=%.2f(%.3f) | DMP: P=%.2f R=%.2f Y=%.2f\n", 
+                             local_kalman_pitch_deg, local_kalman_pitch_variance,
+                             local_kalman_roll_deg, local_kalman_roll_variance,
+                             local_kalman_yaw_deg, local_kalman_yaw_variance,
+                             local_pitch, local_roll, local_yaw);
             }
 
-            accelX = local_ax;
-            accelY = local_ay;
-            accelZ = local_az;
-            gyroX = local_gx * 180.0f / PI;
-            gyroY = local_gy * 180.0f / PI;
-            gyroZ = local_gz * 180.0f / PI;
-            xSemaphoreGive(imuDataMutex);
+            // --- Update Shared Variables (Protected by Mutex) ---
+            if (xSemaphoreTake(imuDataMutex, portMAX_DELAY) == pdTRUE) {
+                pitchAvg = updateEMA(pitchAvg, local_pitch);
+                rollAvg = updateEMA(rollAvg, local_roll);
+                yawAvg = updateEMA(yawAvg, local_yaw);
+                gForceAvg = updateEMA(gForceAvg, local_gForce);
+
+                // Store Kalman filtered values with bounds checking
+                // Check if Kalman values are reasonable (not NaN, not extreme)
+                if (!isnan(local_kalman_pitch_deg) && abs(local_kalman_pitch_deg) < 180.0f && 
+                    local_kalman_pitch_variance > 0.0f && local_kalman_pitch_variance < 10.0f) {
+                    kalmanPitchDeg = local_kalman_pitch_deg;
+                    kalmanPitchVariance = local_kalman_pitch_variance;
+                } else {
+                    // Fallback to EMA (which uses DMP filter as input) if Kalman is unreliable
+                    kalmanPitchDeg = pitchAvg;
+                    kalmanPitchVariance = 10.0f; // High variance to force EMA usage
+                }
+                
+                if (!isnan(local_kalman_roll_deg) && abs(local_kalman_roll_deg) < 180.0f && 
+                    local_kalman_roll_variance > 0.0f && local_kalman_roll_variance < 10.0f) {
+                    kalmanRollDeg = local_kalman_roll_deg;
+                    kalmanRollVariance = local_kalman_roll_variance;
+                } else {
+                    // Fallback to EMA (which uses DMP filter as input) if Kalman is unreliable
+                    kalmanRollDeg = rollAvg;
+                    kalmanRollVariance = 10.0f; // High variance to force EMA usage
+                }
+
+                if (!isnan(local_kalman_yaw_deg) && local_kalman_yaw_deg >= 0.0f && local_kalman_yaw_deg < 360.0f && 
+                    local_kalman_yaw_variance > 0.0f && local_kalman_yaw_variance < 10.0f) {
+                    kalmanYawDeg = local_kalman_yaw_deg;
+                    kalmanYawVariance = local_kalman_yaw_variance;
+                } else {
+                    // Fallback to EMA (which uses DMP filter as input) if Kalman is unreliable
+                    kalmanYawDeg = yawAvg;
+                    kalmanYawVariance = 10.0f; // High variance to force EMA usage
+                }
+
+                // Update speed with Kalman filtered value if variance is low
+                if (kalmanFilter.getSpeedVariance() < KALMAN_VARIANCE_THRESHOLD) {
+                    if (xSemaphoreTake(hallDataMutex, portMAX_DELAY) == pdTRUE) {
+                        // Update direction based on Kalman filter speed
+                        hallDirectionForward = (local_kalman_speed_kmh >= 0);
+                        currentSpeedAvg = abs(local_kalman_speed_kmh);
+                        xSemaphoreGive(hallDataMutex);
+                    }
+                }
+
+                accelX = local_ax;
+                accelY = local_ay;
+                accelZ = local_az;
+                gyroX = local_gx;
+                gyroY = local_gy;
+                gyroZ = local_gz;
+                magX = local_mx;
+                magY = local_my;
+                magZ = local_mz;
+                xSemaphoreGive(imuDataMutex);
+            }
         }
 
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
-}
 
 //------------------------------------------------------------------------------
 // Task: Read Hall Sensors, Calculate Speed and Direction
@@ -751,7 +1099,7 @@ void hallSensorTask(void *pvParameters) {
         if (speed_updated || direction_updated) { // Only take mutex if there's something to update
              if (xSemaphoreTake(hallDataMutex, portMAX_DELAY) == pdTRUE) {
                  if(speed_updated) {
-                    currentSpeedAvg = updateRollingAverage(currentSpeed, local_speed);
+                    currentSpeedAvg = updateEMA(currentSpeedAvg, local_speed);
                  }
                  if(direction_updated) {
                     hallDirectionForward = local_direction;
@@ -902,13 +1250,21 @@ void processingTask(void *pvParameters) {
 
         // --- Jump & Drop Detection
         if (!inJumpState && local_gForce < local_jumpThreshold) { 
-             inJumpState = true; jumpStartTime = currentMillis;
+             inJumpState = true; 
+             jumpStartTime = currentMillis;
+             Serial.println("Jump state started - G: " + String(local_gForce, 2));
         }
+        
         if (inJumpState && local_gForce > local_landingThreshold) {
              unsigned long jumpDuration = currentMillis - jumpStartTime;
              if (jumpDuration > JUMP_DURATION_MIN) {
-                 local_jumpDetected_this_cycle = true; lastJumpTime = currentMillis;
-                 if(!current_jump_state) { Serial.println("JUMP DETECTED! Duration: " + String(jumpDuration) + "ms G: " + String(local_gForce, 2)); }
+                 local_jumpDetected_this_cycle = true; 
+                 lastJumpTime = currentMillis;
+                 if(!current_jump_state) { 
+                     Serial.println("JUMP DETECTED! Duration: " + String(jumpDuration) + "ms G: " + String(local_gForce, 2)); 
+                 }
+             } else {
+                 Serial.println("Jump too short - Duration: " + String(jumpDuration) + "ms (min: " + String(JUMP_DURATION_MIN) + "ms)");
              }
              inJumpState = false;
         }
@@ -1032,9 +1388,13 @@ void bleTask(void *pvParameters) {
                 float ema_roll = rollAvg;
                 float ema_yaw = yawAvg;
 
-                // Kalman Values for pitch
+                // Kalman Values for pitch, roll, and yaw
                 float kf_pitch = kalmanPitchDeg;
+                float kf_roll = kalmanRollDeg;
+                float kf_yaw = kalmanYawDeg;
                 float kf_pitch_variance = kalmanPitchVariance;
+                float kf_roll_variance = kalmanRollVariance;
+                float kf_yaw_variance = kalmanYawVariance;
 
                 // Decide whether to use Kalman or EMA based on variance
                 if (kf_pitch_variance < KALMAN_VARIANCE_THRESHOLD) {
@@ -1042,15 +1402,31 @@ void bleTask(void *pvParameters) {
                 } else {
                     local_pitch = ema_pitch; // Use EMA pitch
                 }
-        
-                // Keep roll and yaw from EMA
-                local_roll = ema_roll;
-                local_yaw = ema_yaw;
+
+                if (kf_roll_variance < KALMAN_VARIANCE_THRESHOLD) {
+                    local_roll = kf_roll; // Use Kalman roll
+                } else {
+                    local_roll = ema_roll; // Use EMA roll
+                }
+
+                if (kf_yaw_variance < KALMAN_VARIANCE_THRESHOLD) {
+                    local_yaw = kf_yaw; // Use Kalman yaw
+                } else {
+                    local_yaw = ema_yaw; // Use EMA yaw
+                }
         
                 local_gForce = gForceAvg; 
                 xSemaphoreGive(imuDataMutex); 
             } else { vTaskDelay(1); continue; }
              if (xSemaphoreTake(eventDataMutex, portMAX_DELAY) == pdTRUE) { local_jump = jumpDetected; local_drop = dropDetected; local_imuDir = imuDirectionForward; local_imuState = imuSpeedState; xSemaphoreGive(eventDataMutex); } else { vTaskDelay(1); continue; }
+             
+             // *** FIX: Read offset values from offsetMutex ***
+             if (xSemaphoreTake(offsetMutex, portMAX_DELAY) == pdTRUE) { 
+                 local_pitchOffset = pitchOffset; 
+                 local_rollOffset = rollOffset; 
+                 local_yawOffset = yawOffset; 
+                 xSemaphoreGive(offsetMutex); 
+             } else { vTaskDelay(1); continue; }
 
             // --- Calculate Zeroed Values ---
             float zeroedPitch = local_pitch - local_pitchOffset;
@@ -1106,9 +1482,12 @@ void displayTask(void *pvParameters) {
     const TickType_t xFrequency = pdMS_TO_TICKS(150); // Update display ~6-7Hz
 
     // Initial display message
-    display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0); display.println("Music Bike RTOS"); display.println("Initializing...");
-    display.display();
+    if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
+        display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0); display.println("Music Bike RTOS"); display.println("Initializing...");
+        display.display();
+        xSemaphoreGive(i2cMutex);
+    }
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     xLastWakeTime = xTaskGetTickCount();
@@ -1161,37 +1540,40 @@ void displayTask(void *pvParameters) {
          // Yaw/Roll calculations removed
 
          // --- Update Display ---
-         display.clearDisplay();
-         display.setTextSize(1);
-         display.setTextColor(SSD1306_WHITE);
-         int yPos = 0; // Current Y position for cursor
+         if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
+             display.clearDisplay();
+             display.setTextSize(1);
+             display.setTextColor(SSD1306_WHITE);
+             int yPos = 0; // Current Y position for cursor
 
-         // Line 0: G-Force and BLE Status
-         display.setCursor(0, yPos); display.print("G:"); display.print(local_gForce, 2);
-         if (isConnected) { display.setCursor(SCREEN_WIDTH - 18, yPos); display.print("BLE"); }
-         yPos += 10;
+             // Line 0: G-Force and BLE Status
+             display.setCursor(0, yPos); display.print("G:"); display.print(local_gForce, 2);
+             if (isConnected) { display.setCursor(SCREEN_WIDTH - 18, yPos); display.print("BLE"); }
+             yPos += 10;
 
-          // Line 1: Jump/Drop Status
-         display.setCursor(0, yPos); display.print("J:"); display.print(local_jump ? "Y" : "N");
-         display.setCursor(32, yPos); display.print(" D:"); display.print(local_drop ? "Y" : "N");
-         yPos += 10;
+              // Line 1: Jump/Drop Status
+             display.setCursor(0, yPos); display.print("J:"); display.print(local_jump ? "Y" : "N");
+             display.setCursor(32, yPos); display.print(" D:"); display.print(local_drop ? "Y" : "N");
+             yPos += 10;
 
-         // Line 2: Pitch and Jump Threshold
-         display.setCursor(0, yPos); display.print("Angle:"); display.print(zeroedPitch, 1); // pitch, called angle on sensor
-         display.setCursor(64, yPos); display.print("Jump:"); display.print(local_jumpThreshold, 2); // Jump Thresh
-         yPos += 10;
+             // Line 2: Pitch and Jump Threshold
+             display.setCursor(0, yPos); display.print("Angle:"); display.print(zeroedPitch, 1); // pitch, called angle on sensor
+             display.setCursor(64, yPos); display.print("Jump:"); display.print(local_jumpThreshold, 2); // Jump Thresh
+             yPos += 10;
 
-         // Line 3: Landing and Drop Thresholds
-         display.setCursor(0, yPos); display.print("Land:"); display.print(local_landingThreshold, 2); // Landing Thresh
-         display.setCursor(64, yPos); display.print("Drop:"); display.print(local_dropThreshold, 2); // Drop Thresh
-         yPos += 10;
+             // Line 3: Landing and Drop Thresholds
+             display.setCursor(0, yPos); display.print("Land:"); display.print(local_landingThreshold, 2); // Landing Thresh
+             display.setCursor(64, yPos); display.print("Drop:"); display.print(local_dropThreshold, 2); // Drop Thresh
+             yPos += 10;
 
-         // Line 4: Speed and Direction
-         display.setCursor(0, yPos); display.print("Spd:"); display.print(local_speed, 1);
-         display.setCursor(64, yPos); display.print("Dir:"); display.print(local_hallDir ? "F" : "R");
-         // yPos += 10; // No more lines needed currently
+             // Line 4: Speed and Direction
+             display.setCursor(0, yPos); display.print("Spd:"); display.print(local_speed, 1);
+             display.setCursor(64, yPos); display.print("Dir:"); display.print(local_hallDir ? "F" : "R");
+             // yPos += 10; // No more lines needed currently
 
-         display.display();
+             display.display();
+             xSemaphoreGive(i2cMutex);
+         }
 
          vTaskDelayUntil(&xLastWakeTime, xFrequency);
      }
@@ -1202,14 +1584,6 @@ void displayTask(void *pvParameters) {
 // SETUP FUNCTION
 //==============================================================================
 void setup() {
-    // Zero rolling average arrays
-    for (int i = 0; i < AVG_SIZE; i++) {
-        pitch[i] = 0.0;
-        roll[i] = 0.0;
-        yaw[i] = 0.0;
-        gForce[i] = 0.0;
-        currentSpeed[i] = 0.0;
-    }
     Serial.begin(115200);
     //while (!Serial); // Waits for USB Serial connection; comment out for standalone/battery operation.
     Serial.println("Music Bike Sensor System Initializing");
@@ -1233,14 +1607,6 @@ void setup() {
     // --- Initialize I2C ---
     Wire.begin(SDA_PIN, SCL_PIN);
 
-    // --- Initialize OLED Display ---
-    if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-        Serial.println(F("SSD1306 allocation failed")); for(;;);
-    }
-    display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0); display.println("Starting RTOS..."); display.display();
-    delay(500);
-
     // --- Create Mutexes ---
     imuDataMutex = xSemaphoreCreateMutex();
     hallDataMutex = xSemaphoreCreateMutex();
@@ -1248,10 +1614,22 @@ void setup() {
     offsetMutex = xSemaphoreCreateMutex();
     bleConnectionMutex = xSemaphoreCreateMutex();
     configMutex = xSemaphoreCreateMutex();
+    i2cMutex = xSemaphoreCreateMutex();
 
-    if (!imuDataMutex || !hallDataMutex || !eventDataMutex || !offsetMutex || !bleConnectionMutex || !configMutex ) {
+    if (!imuDataMutex || !hallDataMutex || !eventDataMutex || !offsetMutex || !bleConnectionMutex || !configMutex || !i2cMutex ) {
         Serial.println("Failed to create mutexes!"); for(;;);
     }
+
+    // --- Initialize OLED Display ---
+    if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
+        if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+            Serial.println(F("SSD1306 allocation failed")); for(;;);
+        }
+        display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0); display.println("Starting RTOS..."); display.display();
+        xSemaphoreGive(i2cMutex);
+    }
+    delay(500);
 
     // --- BLE Initialization ---
     Serial.println("Initializing BLE...");
@@ -1294,9 +1672,12 @@ void setup() {
     BLEDevice::startAdvertising();
     Serial.println("BLE Initialized and Advertising!");
 
-    display.clearDisplay(); display.setCursor(0,0);
-    display.println("BLE Advertising!"); display.println("Creating tasks...");
-    display.display();
+    if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
+        display.clearDisplay(); display.setCursor(0,0);
+        display.println("BLE Advertising!"); display.println("Creating tasks...");
+        display.display();
+        xSemaphoreGive(i2cMutex);
+    }
     delay(500);
 
     // --- Create Tasks ---
@@ -1310,7 +1691,10 @@ void setup() {
     ret = xTaskCreatePinnedToCore(displayTask, "DisplayTask", 4096, NULL, 1, &displayTaskHandle, 1);
 
     Serial.println("Tasks created. Initialization complete!");
-    display.clearDisplay(); display.setCursor(0,0); display.println("Tasks Running!"); display.display();
+    if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
+        display.clearDisplay(); display.setCursor(0,0); display.println("Tasks Running!"); display.display();
+        xSemaphoreGive(i2cMutex);
+    }
 }
 
 //==============================================================================
@@ -1319,3 +1703,4 @@ void setup() {
 void loop() {
       vTaskDelay(pdMS_TO_TICKS(1000));
 }
+

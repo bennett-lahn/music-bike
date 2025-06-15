@@ -1,3 +1,25 @@
+/*
+ * MusicFragment.kt - Music Control User Interface
+ * 
+ * This fragment provides the main user interface for controlling music playback
+ * and managing FMOD parameter settings. It allows users to switch between manual
+ * and automatic modes for various audio parameters.
+ * 
+ * Key Features:
+ * - Music playback controls (play/pause/bank selection)
+ * - Manual parameter adjustment via sliders and controls
+ * - Automatic mode integration with BLE sensor data
+ * - Real-time display of current parameter values
+ * - Ride statistics display and reset functionality
+ * - BLE connection status monitoring
+ * 
+ * UI Components:
+ * - Bank selector for choosing audio banks
+ * - Parameter controls (speed, pitch, events, direction)
+ * - Auto mode switches for BLE integration
+ * - Statistics display for ride tracking
+ * - Connection status indicators
+ */
 package com.app.musicbike.ui.fragments
 
 import android.content.Context
@@ -20,6 +42,12 @@ import com.app.musicbike.ui.viewmodels.MusicViewModel
 import java.io.File
 import java.util.*
 
+/**
+ * MusicFragment - Main UI for music control and parameter management
+ * 
+ * Provides controls for FMOD playback and real-time parameter adjustment.
+ * Integrates with MusicService and BleService for audio and sensor functionality.
+ */
 class MusicFragment : Fragment() {
 
     private val TAG = "MusicFragment"
@@ -28,14 +56,18 @@ class MusicFragment : Fragment() {
     private val handler = Handler(Looper.getMainLooper())
 
     private val musicViewModel: MusicViewModel by viewModels()
-
     private var bleService: BleService? = null
 
+    // UI state tracking for auto mode switches
     private var isWheelSpeedAutoUi = false
     private var isPitchAutoUi = false
     private var isEventAutoUi = false
     private var isHallDirectionAutoUi = false
 
+    /**
+     * Check if BLE service is connected and ready for data transmission
+     * @return true if BLE is connected, false otherwise
+     */
     private fun isBleConnected(): Boolean {
         val mainActivity = activity as? MainActivity
         this.bleService = mainActivity?.getBleServiceInstance()
@@ -51,14 +83,20 @@ class MusicFragment : Fragment() {
         return binding.root
     }
 
-    // Called by MainActivity when BleService is ready
+    /**
+     * Called by MainActivity when BleService is ready for use
+     * Sets up BLE service reference and updates UI accordingly
+     */
     fun onServiceReady() {
         Log.d(TAG, "onServiceReady (for BleService) called.")
         this.bleService = (activity as? MainActivity)?.getBleServiceInstance()
         updateUiBasedOnBleConnection()
     }
 
-    // Called by MainActivity when MusicService is ready
+    /**
+     * Called by MainActivity when MusicService is ready for use
+     * Initializes music service connection and loads default bank
+     */
     fun onMusicServiceReady(service: MusicService?) {
         Log.d(TAG, "onMusicServiceReady called with service: $service")
         musicViewModel.setMusicService(service, viewLifecycleOwner)
@@ -80,6 +118,11 @@ class MusicFragment : Fragment() {
     }
 
 
+    /**
+     * Copy an asset file to internal storage for FMOD access
+     * @param assetName Name of the asset file to copy
+     * @return Absolute path to the copied file
+     */
     private fun copyAssetToInternalStorage(assetName: String): String {
         val file = File(requireContext().filesDir, assetName)
         if (file.exists()) file.delete()
@@ -112,15 +155,21 @@ class MusicFragment : Fragment() {
         updateUiBasedOnBleConnection()
     }
 
+    /**
+     * Initialize all UI components and set up event listeners
+     * Configures controls for music playback and parameter adjustment
+     */
     private fun setupUI() {
         Log.d(TAG, "setupUI called")
 
+        // Music playback toggle button
         binding.toggleButton.setOnClickListener {
             Log.d(TAG, "ToggleButton in MusicFragment - CLICKED!")
             musicViewModel.togglePlayback()
         }
 
-        // Bank Selector
+        // === BANK SELECTOR SETUP ===
+        // Dropdown for selecting different FMOD audio banks
         val bankSpinner = binding.bankSelector
         val allBanks = requireContext().assets.list("")?.filter {
             it.endsWith(".bank") && !it.endsWith("strings.bank")
@@ -145,7 +194,7 @@ class MusicFragment : Fragment() {
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
 
-        // Wheel Speed
+        // === WHEEL SPEED PARAMETER CONTROL ===
         setupSeekBar(binding.wheelSpeedSeekBar, binding.wheelSpeedLabel, "Wheel Speed", 25, 0, 0) { value ->
             if (musicViewModel.isWheelSpeedAuto.value != true) {
                 musicViewModel.setFmodParameter("Wheel Speed", value)
@@ -160,7 +209,7 @@ class MusicFragment : Fragment() {
             musicViewModel.setWheelSpeedAuto(isChecked)
         }
 
-        // Pitch
+        // === PITCH PARAMETER CONTROL ===
         setupSeekBar(binding.pitchSeekBar, binding.pitchLabel, "Pitch", 90, -45, 45) { value ->
             if (musicViewModel.isPitchAuto.value != true) {
                 musicViewModel.setFmodParameter("Pitch", value)
@@ -187,7 +236,8 @@ class MusicFragment : Fragment() {
         binding.pitchReverseSwitch.isEnabled = musicViewModel.isPitchAuto.value ?: false
 
 
-        // Event
+        // === EVENT PARAMETER CONTROL ===
+        // Dropdown for manually triggering bike events
         val events = arrayOf("None", "Jump", "Drop", "180")
         val eventAdapter = ArrayAdapter(requireContext(), android.R.layout.simple_spinner_item, events)
         binding.eventSpinner.adapter = eventAdapter
@@ -212,7 +262,8 @@ class MusicFragment : Fragment() {
             musicViewModel.setEventAuto(isChecked)
         }
 
-        // Hall Direction
+        // === HALL DIRECTION PARAMETER CONTROL ===
+        // Dropdown for setting bike direction (forward/reverse)
         val hallDirectionOptions = arrayOf("Forward", "Reverse")
         val hallAdapter = ArrayAdapter(requireContext(), android.R.layout.simple_spinner_item, hallDirectionOptions)
         binding.hallDirectionSpinner.adapter = hallAdapter
@@ -236,7 +287,8 @@ class MusicFragment : Fragment() {
             musicViewModel.setHallDirectionAuto(isChecked)
         }
 
-        // Auto All Switch
+        // === AUTO ALL SWITCH ===
+        // Master switch to enable/disable all auto modes simultaneously
         binding.autoAllSwitch.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked && !isBleConnected()) {
                 showToast("BLE not connected. Auto All cancelled.")
@@ -251,7 +303,7 @@ class MusicFragment : Fragment() {
             musicViewModel.setHallDirectionAuto(isChecked)
         }
 
-        // Reset Stats Button Listener
+        // === STATISTICS RESET BUTTON ===
         binding.resetStatsButton.setOnClickListener {
             Log.d(TAG, "Reset Stats button clicked.")
             musicViewModel.resetStats()
@@ -260,9 +312,14 @@ class MusicFragment : Fragment() {
         }
     }
 
+    /**
+     * Set up observers for ViewModel LiveData to update UI in real-time
+     * Observes playback state, parameter values, auto mode states, and statistics
+     */
     private fun observeViewModel() {
         Log.d(TAG, "Setting up ViewModel observers.")
 
+        // === PLAYBACK STATE OBSERVER ===
         musicViewModel.isPlaying.observe(viewLifecycleOwner, Observer { isPlaying ->
             Log.d(TAG, "isPlaying changed: $isPlaying")
             binding.toggleButton.text = if (isPlaying) "Pause" else "Play"
@@ -328,7 +385,8 @@ class MusicFragment : Fragment() {
             }
         }
 
-        // Observers for auto mode states
+        // === AUTO MODE STATE OBSERVERS ===
+        // Update UI controls based on auto mode states
         musicViewModel.isWheelSpeedAuto.observe(viewLifecycleOwner) { isAuto ->
             if (binding.wheelSpeedModeSwitch.isChecked != isAuto) binding.wheelSpeedModeSwitch.isChecked = isAuto
             binding.wheelSpeedSeekBar.isEnabled = !isAuto
@@ -355,7 +413,8 @@ class MusicFragment : Fragment() {
             Log.d(TAG, "Observed pitchReversalEnabled from ViewModel: $isReversed, UI Switch updated.")
         }
 
-        // Observers for Stats LiveData
+        // === RIDE STATISTICS OBSERVERS ===
+        // Update statistics display in real-time
         musicViewModel.maxSpeed.observe(viewLifecycleOwner) { maxSpeed ->
             binding.maxSpeedStatText.text = String.format(Locale.US, "Max Speed: %.1f km/h", maxSpeed)
         }
@@ -377,6 +436,10 @@ class MusicFragment : Fragment() {
         }
     }
 
+    /**
+     * Update UI state based on BLE connection status
+     * Disables auto mode switches when BLE is not connected
+     */
     private fun updateUiBasedOnBleConnection() {
         val connected = isBleConnected()
         Log.d(TAG, "updateUiBasedOnBleConnection: BLE connected = $connected")
@@ -389,6 +452,16 @@ class MusicFragment : Fragment() {
         }
     }
 
+    /**
+     * Configure a SeekBar with label and change listener
+     * @param seekBar The SeekBar to configure
+     * @param label TextView to display current value
+     * @param labelText Base text for the label
+     * @param max Maximum value for the SeekBar
+     * @param offset Value offset for calculations
+     * @param initialProgress Initial progress value
+     * @param onChange Callback for value changes
+     */
     private fun setupSeekBar(
         seekBar: SeekBar, label: TextView, labelText: String,
         max: Int, offset: Int, initialProgress: Int,
@@ -434,6 +507,10 @@ class MusicFragment : Fragment() {
         handler.removeCallbacksAndMessages(null)
     }
 
+    /**
+     * Base implementation of SeekBarChangeListener with empty methods
+     * Allows subclasses to override only needed methods
+     */
     open class SimpleSeekBarChangeListener : SeekBar.OnSeekBarChangeListener {
         override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {}
         override fun onStartTrackingTouch(seekBar: SeekBar?) {}

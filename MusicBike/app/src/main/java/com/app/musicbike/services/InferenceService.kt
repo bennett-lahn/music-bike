@@ -1,3 +1,6 @@
+// WARNING: This file is currently DEPRECATED.file
+// Machine learning is currently unused. An algorithm on the embedded system is used instead.
+
 package com.app.musicbike.services
 
 import android.app.Service
