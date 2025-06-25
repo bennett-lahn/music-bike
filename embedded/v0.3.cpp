@@ -1,3 +1,10 @@
+/*
+ * DEPRECATED: This version (v0.3) is no longer maintained.
+ * Please use Bike_Sensor_Filtered_IMU.ino for the current implementation.
+ * 
+ * This file remains for reference purposes only.
+ */
+
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>

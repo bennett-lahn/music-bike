@@ -2,7 +2,7 @@
 ### **Overview**
 Music Bike is an embedded systems project aimed at creating a hardware-software solution that adapts music playback in real time by leveraging sensors to collect data like speed, pitch, roll, yaw, angular velocity, and acceleration. With these parameters, Music Bike can adapt the tempo, instrumentation, and endless other musical elements powered by the professional audio engine FMOD Studio.
 
-#### Project Demo
+#### Project Demo - Click to Watch on YouTube
 
 [![Music Bike Project Demo](https://img.youtube.com/vi/FAYNOim8kmM/maxresdefault.jpg)](https://youtu.be/FAYNOim8kmM)
 
@@ -55,7 +55,7 @@ Music Bike is an embedded systems project aimed at creating a hardware-software 
 ---
 
 ### **Contributing**
-Anyone interested in contributing is encouraged to fork the project and submit a pull request. We can't wait to see what you'll do with our platform!
+Anyone interested in contributing is encouraged to fork the project and submit a pull request. Please contact us if you are interested in acquiring your own sensor pack to interface with the Music Bike app. We can't wait to see what you'll do with our platform!
 
 ---
 
