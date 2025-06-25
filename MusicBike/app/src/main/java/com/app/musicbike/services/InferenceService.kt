@@ -1,4 +1,38 @@
-// WARNING: This file is currently DEPRECATED.file
+/*
+ * InferenceService.kt - Machine Learning Inference Service for Bike Trick Detection
+ * 
+ * WARNING: This file is currently DEPRECATED.
+ * Machine learning is currently unused. An algorithm on the embedded system is used instead.
+ * 
+ * This foreground service was designed to perform real-time machine learning inference
+ * on bike sensor data to detect tricks and riding patterns. The service integrates with
+ * the MusicService ecosystem but is currently unused in favor of embedded algorithms.
+ * 
+ * Original Architecture:
+ * - Real-time TensorFlow Lite inference using Google Play Services
+ * - Continuous sensor data buffering and preprocessing
+ * - Integration with BleService for live sensor data streams
+ * - LiveData broadcasting of inference results to UI components
+ * - Background thread processing for non-blocking inference
+ * 
+ * Connection to MusicService:
+ * - MusicService can start/stop this service via ACTION_START_INFERENCE/ACTION_STOP_INFERENCE
+ * - Inference results would be broadcast via LocalBroadcastManager
+ * - Results could influence FMOD parameters for reactive audio feedback
+ * - Service runs independently but coordinates with music playback state
+ * 
+ * Key Features:
+ * - FP32 TensorFlow Lite model with metadata support
+ * - Circular buffer management for time-series data
+ * - Automatic inference triggering based on data accumulation
+ * - Foreground service for continuous operation
+ * - Real-time trick classification (jumps, drops, 180° spins)
+ * - Buffer clearing on trick detection to prevent duplicate events
+ * 
+ * This service remains in the codebase for future ML integration possibilities.
+ */
+
+// WARNING: This file is currently DEPRECATED.
 // Machine learning is currently unused. An algorithm on the embedded system is used instead.
 
 package com.app.musicbike.services
@@ -48,6 +82,13 @@ import java.io.BufferedReader
 import java.io.FileInputStream
 import java.io.InputStreamReader
 
+/**
+ * InferenceService - Deprecated ML inference service for bike trick detection
+ * 
+ * This foreground service manages TensorFlow Lite model inference on real-time sensor data.
+ * Originally designed to detect bike tricks (jumps, drops, 180° spins) using machine learning,
+ * but currently unused in favor of embedded system algorithms.
+ */
 class InferenceService : Service() {
 
     private var interpreter: InterpreterApi? = null
@@ -79,7 +120,10 @@ class InferenceService : Service() {
     val inferenceResult: LiveData<String> get() = _inferenceResult
     var isModelReady = false
 
-    // Data class for sensor readings
+    /**
+     * Data class for sensor readings in the inference pipeline
+     * Represents a single timestamped sensor measurement containing bike orientation and motion data
+     */
     data class SensorReading(
         val pitch: Float,
         val roll: Float,
@@ -88,7 +132,11 @@ class InferenceService : Service() {
         val timestamp: Long = System.currentTimeMillis()
     )
 
-    // Handler that receives messages from the thread
+    /**
+     * Handler that receives messages from the background thread
+     * Processes sensor data additions and inference requests in a dedicated thread
+     * to avoid blocking the main UI thread during ML operations
+     */
     private inner class ServiceHandler(looper: Looper) : Handler(looper) {
         override fun handleMessage(msg: Message) {
             try {
@@ -113,10 +161,20 @@ class InferenceService : Service() {
         private const val MSG_RUN_INFERENCE = 2
     }
 
+    /**
+     * Binder class for local service binding
+     * Allows MusicService and other components to access InferenceService methods
+     * and control inference operations programmatically
+     */
     inner class LocalBinder : Binder() {
         fun getService(): InferenceService = this@InferenceService
     }
 
+    /**
+     * Service initialization - Sets up inference pipeline and foreground service
+     * Creates background thread, initializes sensor buffer, loads TensorFlow Lite model,
+     * and establishes foreground service notification for continuous operation
+     */
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "onCreate")
@@ -136,6 +194,10 @@ class InferenceService : Service() {
         }
     }
 
+    /**
+     * Initialize circular buffer for sensor data storage
+     * Clears any existing data and resets write counters for fresh inference session
+     */
     private fun initializeSensorBuffer() {
         bufferLock.withLock {
             sensorBuffer.clear()
@@ -144,11 +206,21 @@ class InferenceService : Service() {
         Log.d(TAG, "Sensor buffer initialized with size $BUFFER_SIZE")
     }
 
+    /**
+     * Public interface for adding sensor data to the inference pipeline
+     * Called by external services (like BleService) to feed real-time sensor readings
+     * Queues data for background processing to avoid blocking caller thread
+     */
     fun addSensorData(pitch: Float, roll: Float, yaw: Float, gforce: Float) {
         val sensorReading = SensorReading(pitch, roll, yaw, gforce)
         serviceHandler?.obtainMessage(MSG_ADD_SENSOR_DATA, sensorReading)?.sendToTarget()
     }
 
+    /**
+     * Background processing of incoming sensor data
+     * Manages circular buffer, triggers inference when sufficient data is available,
+     * and maintains proper sequence length for time-series ML model input
+     */
     private fun addSensorDataToBuffer(sensorReading: SensorReading) {
         bufferLock.withLock {
             if (sensorBuffer.size >= BUFFER_SIZE) {
@@ -168,6 +240,10 @@ class InferenceService : Service() {
         }
     }
     
+    /**
+     * Load TensorFlow Lite model file from assets
+     * Maps model file into memory for efficient repeated access during inference
+     */
     @Throws(IOException::class)
     private fun loadModelFile(modelFilename: String): MappedByteBuffer {
         assets.openFd(modelFilename).use { fileDescriptor ->
@@ -180,6 +256,11 @@ class InferenceService : Service() {
         }
     }
 
+    /**
+     * Initialize TensorFlow Lite model with Google Play Services
+     * Loads FP32 model with metadata, extracts input/output shapes and class labels,
+     * and prepares interpreter for real-time inference operations
+     */
     private fun loadLiteRTModel() {
         initializeTask.addOnSuccessListener {
             try {
@@ -262,7 +343,11 @@ class InferenceService : Service() {
     }
     fun hasCustomClassNames(): Boolean = classNames.isNotEmpty() && classNames.first() != "ErrorLoadingLabels"
 
-
+    /**
+     * Prepare sensor data for TensorFlow Lite model input
+     * Extracts recent sensor readings from circular buffer, formats as float32 tensor,
+     * and ensures proper sequence length and feature count for model compatibility
+     */
     private fun prepareInputData(): TensorBuffer? {
         if (metadataExtractor == null || !::inputShape.isInitialized || inputShape.isEmpty()) {
             Log.e(TAG, "MetadataExtractor or inputShape not initialized.")
@@ -312,6 +397,11 @@ class InferenceService : Service() {
         return inputTensorBuffer
     }
     
+    /**
+     * Execute machine learning inference on buffered sensor data
+     * Runs TensorFlow Lite model to classify bike tricks from time-series sensor input,
+     * measures inference performance, and processes results for downstream consumption
+     */
     private fun performInference() {
         if (interpreter == null || metadataExtractor == null || !::inputShape.isInitialized || !::outputShape.isInitialized || !isModelReady) {
             Log.e(TAG, "Interpreter, metadata, or shapes not initialized properly.")
@@ -357,6 +447,11 @@ class InferenceService : Service() {
         }
     }
 
+    /**
+     * Process ML model output and determine detected bike trick
+     * Analyzes probability distribution, identifies highest confidence prediction,
+     * broadcasts results to UI components, and manages buffer state for next inference
+     */
     private fun processOutput(outputData: FloatArray, inferenceTime: Long) {
         Log.d(TAG, "Processing output...")
         if (outputData.isEmpty()) {
@@ -382,6 +477,11 @@ class InferenceService : Service() {
         }
     }
 
+    /**
+     * Broadcast inference results to other app components
+     * Sends LocalBroadcast with trick detection results and updates LiveData
+     * for UI observation. Results can be consumed by MusicService for audio feedback
+     */
     private fun sendResultToClient(result: String) {
         val intent = Intent("com.app.musicbike.INFERENCE_RESULT")
         intent.putExtra("result_data", result)
@@ -390,8 +490,18 @@ class InferenceService : Service() {
         _inferenceResult.postValue(result)
     }
 
+    /**
+     * Manually trigger inference on current buffer contents
+     * Public method for external components to request immediate inference
+     * regardless of automatic triggering conditions
+     */
     fun triggerInference() = serviceHandler?.obtainMessage(MSG_RUN_INFERENCE)?.sendToTarget()
     
+    /**
+     * Reload TensorFlow Lite model after failure
+     * Resets all model components and attempts fresh initialization
+     * Used for error recovery when initial model loading fails
+     */
     fun retryLoadModel() { 
         Log.d(TAG, "Retrying model load...")
         isModelReady = false
@@ -401,8 +511,18 @@ class InferenceService : Service() {
         loadLiteRTModel() 
     }
     
+    /**
+     * Check if ML model is fully ready for inference
+     * Validates that all required components (interpreter, metadata, shapes, labels)
+     * are properly initialized and functional
+     */
     fun checkModelReady(): Boolean = isModelReady && interpreter != null && metadataExtractor != null && ::inputShape.isInitialized && ::outputShape.isInitialized && classNames.isNotEmpty() && classNames.first() != "ErrorLoadingLabels"
     
+    /**
+     * Get current status of sensor buffer and model readiness
+     * Provides diagnostic information for debugging and UI status display
+     * including buffer fill level, write count, and model state
+     */
     fun getBufferStatus(): String {
         return bufferLock.withLock {
             val modelStatus = if (checkModelReady()) "Model: Ready" else "Model: Not loaded/Ready"
@@ -411,6 +531,11 @@ class InferenceService : Service() {
         } 
     }
     
+    /**
+     * Create notification channel for foreground service
+     * Sets up low-priority notification channel for continuous service operation
+     * without disturbing user with frequent notifications
+     */
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(NOTIFICATION_CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW).apply {
@@ -421,6 +546,11 @@ class InferenceService : Service() {
         }
     }
 
+    /**
+     * Create persistent notification for foreground service
+     * Builds notification indicating ML inference service is active and processing
+     * sensor data for bike trick recognition
+     */
     private fun createNotification(): Notification {
         val notificationIntent = Intent(this, MainActivity::class.java)
         val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
