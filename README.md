@@ -7,7 +7,7 @@ Music Bike is an embedded systems project aimed at creating a hardware-software 
 [![Music Bike Project Demo](https://img.youtube.com/vi/FAYNOim8kmM/maxresdefault.jpg)](https://youtu.be/FAYNOim8kmM)
 
 #### **Media Coverage**
-- **[Hackaday Feature](https://hackaday.com/2025/06/22/an-adaptive-soundntrack-for-bike-tricks)** - "An Adaptive Soundtrack for Bike Tricks" - June 2025
+- **[Hackaday Feature](https://hackaday.com/2025/06/22/an-adaptive-soundtrack-for-bike-tricks)** - "An Adaptive Soundtrack for Bike Tricks" - June 2025
 
 ---
 
@@ -47,10 +47,10 @@ Music Bike is an embedded systems project aimed at creating a hardware-software 
 ---
 
 ### **Team Members**
-- *Bennett Lahn* – Computer engineering student @ University of Washington
-- *Nick Baroody* – Electrical & computer engineering 2025 alumni, University of Washington
-- *Ethan Diep* – Electrical & computer engineering 2025 alumni, University of Washington
-- *Matthew Pham* - Electrical & computer engineering 2025 alumni, University of Washington
+- *Bennett Lahn* – Computer Engineering student @ University of Washington
+- *Nick Baroody* – Electrical & Computer Engineering 2025 alumni, University of Washington
+- *Ethan Diep* – Electrical & Computer Engineering 2025 alumni, University of Washington
+- *Matthew Pham* - Electrical & Computer Engineering 2025 alumni, University of Washington
 
 ---
 
