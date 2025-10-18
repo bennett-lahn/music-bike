@@ -1,3 +1,7 @@
+// WARNING: THIS FILE IS DEPRECATED.
+// Bike_Sensor_Filtered_IMU.ino is the only up to date code for the embedded platform
+// This file is kept for reference only.
+
 // Includes remain mostly the same
 #include <Wire.h>
 #include <Adafruit_GFX.h>

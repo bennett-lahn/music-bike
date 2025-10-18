@@ -1,3 +1,32 @@
+/*
+ * BleService.kt - Bluetooth Low Energy Communication Service
+ * 
+ * This foreground service manages all BLE operations for connecting to and
+ * communicating with the Music Bike embedded system. It handles device scanning,
+ * GATT connection management, and real-time sensor data reception.
+ * 
+ * Key Features:
+ * - BLE device scanning with service UUID filtering
+ * - GATT connection lifecycle management
+ * - Service and characteristic discovery
+ * - Real-time sensor data reception via notifications
+ * - Thread-safe data handling with LiveData
+ * - Foreground service for background operation
+ * - Permission handling for Android BLE requirements
+ * 
+ * Data Streams:
+ * - Speed, pitch, roll, yaw from IMU sensor
+ * - G-force measurements for jump/drop detection
+ * - Event notifications (jumps, drops, 180° spins)
+ * - Direction data from hall sensors and IMU
+ * - Speed state classifications
+ * 
+ * Architecture:
+ * - Runs as foreground service for reliability
+ * - Exposes LiveData for UI observation
+ * - Uses queue-based notification setup for reliability
+ * - Handles Android permission requirements across versions
+ */
 package com.app.musicbike.services // Ensure this package declaration matches file location
 
 // Android & System Imports
@@ -55,21 +84,25 @@ import com.app.musicbike.R
 
 
 /**
- * A background Service to manage Bluetooth Low Energy (BLE) communication.
- * Handles scanning for devices, connecting via GATT, discovering services/characteristics,
- * and communicating status/data back to the UI using LiveData.
- * Runs as a Foreground Service to ensure reliability when the app is in the background.
+ * BleService - Core Bluetooth Low Energy communication service
+ * 
+ * Manages the complete BLE communication lifecycle from device discovery
+ * to real-time sensor data streaming. Runs as a foreground service to
+ * ensure continuous operation even when the app is backgrounded.
  */
 @SuppressLint("MissingPermission") // Suppress warnings: Permissions checked in UI before calling methods
 class BleService : Service() {
 
-    // --- Constants ---
+    // === CONSTANTS AND CONFIGURATION ===
     companion object {
         private const val SCAN_PERIOD: Long = 10000 // Stops scanning after 10 seconds.
-        private val TAG = "BleService" // Tag for Logcat messages
+        private val TAG = "BleService"
+        
+        // Standard BLE descriptor UUID for enabling notifications
         private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-        // Service & Characteristic UUIDs (ensure these match your ESP32 definitions)
+        // === MUSIC BIKE BLE SERVICE UUIDS ===
+        // These UUIDs must match the ESP32 embedded system definitions
         private val MUSIC_BIKE_SERVICE_UUID: UUID = UUID.fromString("0fb899fa-2b3a-4e11-911d-4fa05d130dc1")
         private val SPEED_CHARACTERISTIC_UUID: UUID = UUID.fromString("a635fed5-9a19-4e31-8091-84d020481329")
         private val PITCH_CHARACTERISTIC_UUID: UUID = UUID.fromString("726c4b96-bc56-47d2-95a1-a6c49cce3a1f")
@@ -82,16 +115,13 @@ class BleService : Service() {
         private val IMU_SPEED_STATE_CHARACTERISTIC_UUID: UUID = UUID.fromString("738f5e54-5479-4941-ae13-caf4a9b07b2e")
         private val ACCELEROMETER_ZERO_CHARACTERISTIC_UUID: UUID = UUID.fromString("a29ff0d6-5bf9-4878-83f0-9f66a7e35a15")
 
-        // Constants for Foreground Service Notification
+        // === FOREGROUND SERVICE NOTIFICATION CONSTANTS ===
         private const val NOTIFICATION_CHANNEL_ID = "BleServiceChannel"
         private const val NOTIFICATION_CHANNEL_NAME = "BLE Background Service"
-        private const val ONGOING_NOTIFICATION_ID = 101 // Must be > 0
-
-        // Optional: Action for Intent to stop the service from notification
-        // const val ACTION_STOP_SERVICE = "com.app.musicbike.services.STOP_SERVICE"
+        private const val ONGOING_NOTIFICATION_ID = 101
     }
 
-    // --- Bluetooth & State Variables ---
+    // === BLUETOOTH STATE MANAGEMENT ===
     private lateinit var bluetoothManager: BluetoothManager
     private var bluetoothAdapter: BluetoothAdapter? = null
     private val bluetoothLeScanner by lazy { bluetoothAdapter?.bluetoothLeScanner }
@@ -100,26 +130,27 @@ class BleService : Service() {
     private val foundDevices = mutableMapOf<String, BluetoothDevice>()
     private var bluetoothGatt: BluetoothGatt? = null
     private var connectionAttemptAddress: String? = null
+    
+    // Queue-based notification setup for reliable characteristic configuration
     private val notificationQueue = ArrayDeque<BluetoothGattCharacteristic>()
     @Volatile
     private var isProcessingQueue = false
 
-    // For Foreground Service Notification
+    // Foreground service notification management
     private lateinit var notificationManager: NotificationManager
 
 
-    // --- LiveData for UI Communication ---
+    // === LIVEDATA FOR UI COMMUNICATION ===
+    // Connection status with automatic notification updates
     private val _connectionStatus = MutableLiveData("Idle").apply {
-        // Observe changes to update notification content.
-        // For a long-running service, ensure this observer doesn't cause issues if the
-        // service is ever fully destroyed and recreated in complex scenarios.
-        // However, for a persistent foreground service, this is generally acceptable.
+        // Automatically update foreground notification when connection status changes
         observeForever { status ->
-            if(this@BleService::notificationManager.isInitialized) { // Check if service is ready to update notification
+            if(this@BleService::notificationManager.isInitialized) {
                 updateNotificationContent("Status: $status")
             }
         }
     }
+    // Sensor data LiveData streams
     private val _scanResults = MutableLiveData<List<BluetoothDevice>>(emptyList())
     private val _speed = MutableLiveData(0.0f)
     private val _pitch = MutableLiveData(0.0f)
@@ -131,10 +162,12 @@ class BleService : Service() {
     private val _imuSpeedState = MutableLiveData(0)
     private val _gForce = MutableLiveData(0.0f)
 
+    // Event timeout handling to reset event status
     private val eventTimeoutHandler = Handler(Looper.getMainLooper())
     private val EVENT_TIMEOUT_MS = 3000L
     private val resetEventRunnable = Runnable { _lastEvent.postValue("NONE") }
 
+    // Public LiveData accessors for UI observation
     val connectionStatus: LiveData<String> get() = _connectionStatus
     val scanResults: LiveData<List<BluetoothDevice>> get() = _scanResults
     val speed: LiveData<Float> get() = _speed
@@ -147,13 +180,22 @@ class BleService : Service() {
     val imuSpeedState: LiveData<Int> get() = _imuSpeedState
     val gForce: LiveData<Float> get() = _gForce
 
-    // --- Binder ---
+    // === SERVICE BINDING ===
     private val binder = LocalBinder()
+    
+    /**
+     * Binder class for local service binding
+     * Allows other components to access BleService instance
+     */
     inner class LocalBinder : Binder() {
         fun getService(): BleService = this@BleService
     }
 
-    // --- Service Lifecycle Methods ---
+    // === SERVICE LIFECYCLE METHODS ===
+    
+    /**
+     * Service creation - Initialize Bluetooth and notification system
+     */
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "onCreate: Service instance created.")
@@ -165,19 +207,18 @@ class BleService : Service() {
         }
     }
 
+    /**
+     * Handle service start commands and configure foreground service
+     * Sets up appropriate foreground service type based on Android version and permissions
+     */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand received.")
-
-        // if (intent?.action == ACTION_STOP_SERVICE) {
-        //     Log.d(TAG, "Received stop service action from notification.")
-        //     disconnectAndStopService()
-        //     return START_NOT_STICKY
-        // }
 
         val initialNotificationText = _connectionStatus.value ?: "BLE service starting..."
         val notification = buildNotification(initialNotificationText)
 
-        // Check if we have ALL required permissions for FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        // === PERMISSION VALIDATION FOR FOREGROUND SERVICE TYPE ===
+        // Check required permissions for FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
         val hasConnectPermission = hasConnectPermission()
         val hasScanPermission = hasScanPermission()
         val hasAdvertisePermission = hasPermission(Manifest.permission.BLUETOOTH_ADVERTISE)
@@ -185,9 +226,6 @@ class BleService : Service() {
         
         Log.d(TAG, "Permission check - Connect: $hasConnectPermission, Scan: $hasScanPermission, Advertise: $hasAdvertisePermission, ForegroundService: $hasForegroundServicePermission")
         
-        // For CONNECTED_DEVICE type, we need:
-        // 1. FOREGROUND_SERVICE_CONNECTED_DEVICE (required)
-        // 2. At least one of: BLUETOOTH_ADVERTISE, BLUETOOTH_CONNECT, BLUETOOTH_SCAN, etc.
         val hasRequiredPermissions = hasForegroundServicePermission && 
             (hasConnectPermission || hasScanPermission || hasAdvertisePermission)
 
@@ -357,11 +395,19 @@ class BleService : Service() {
         stopSelf()
     }
 
-    // --- Permission Check Helpers --- (Original - Unchanged)
+    // === PERMISSION CHECK HELPERS ===
+    
+    /**
+     * Check if a specific permission is granted
+     */
     private fun hasPermission(permission: String): Boolean {
         return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
     }
 
+    /**
+     * Check scan permission based on Android version
+     * Android 12+ requires BLUETOOTH_SCAN, older versions need FINE_LOCATION
+     */
     private fun hasScanPermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             hasPermission(Manifest.permission.BLUETOOTH_SCAN)
@@ -370,6 +416,10 @@ class BleService : Service() {
         }
     }
 
+    /**
+     * Check connect permission based on Android version
+     * Android 12+ requires BLUETOOTH_CONNECT, older versions don't need it
+     */
     private fun hasConnectPermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
@@ -378,7 +428,12 @@ class BleService : Service() {
         }
     }
 
-    // --- BLE Scan Operations --- (Original - Unchanged, _connectionStatus will trigger notification updates)
+    // === BLE SCAN OPERATIONS ===
+    
+    /**
+     * Start BLE device scanning with service UUID filtering
+     * Automatically stops after SCAN_PERIOD timeout
+     */
     fun startScan() {
         Log.d(TAG, "startScan requested.")
         if (!hasScanPermission()) {
@@ -426,6 +481,10 @@ class BleService : Service() {
         }
     }
 
+    /**
+     * Stop BLE device scanning
+     * Updates connection status and cleans up scan resources
+     */
     fun stopScan() {
         if (!scanning) return
         Log.d(TAG, "stopScan: Stopping BLE Scan...")
@@ -453,7 +512,10 @@ class BleService : Service() {
         }
     }
 
-    private val leScanCallback = object : ScanCallback() { // (Original - Unchanged)
+    /**
+     * BLE scan callback to handle discovered devices and scan failures
+     */
+    private val leScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             val device = result?.device ?: return
             try {
@@ -476,8 +538,13 @@ class BleService : Service() {
         }
     }
 
-    // --- GATT Connection Operations ---
-    // (connect, disconnect, closeGatt updated to ensure _connectionStatus.postValue triggers notification updates)
+    // === GATT CONNECTION OPERATIONS ===
+    
+    /**
+     * Connect to a BLE device by MAC address
+     * @param address MAC address of the device to connect to
+     * @return true if connection attempt was initiated successfully
+     */
     fun connect(address: String): Boolean {
         Log.d(TAG, "connect: Attempting connection to address: $address")
         if (bluetoothAdapter?.isEnabled != true) {
@@ -548,6 +615,10 @@ class BleService : Service() {
         return true
     }
 
+    /**
+     * Disconnect from the currently connected BLE device
+     * Triggers GATT disconnection and status updates
+     */
     fun disconnect() {
         val gatt = bluetoothGatt ?: run {
             Log.w(TAG, "disconnect: Not connected (bluetoothGatt is null).")
@@ -615,9 +686,12 @@ class BleService : Service() {
     }
 
 
-    // --- GATT Callback Implementation ---
-    // (onConnectionStateChange, onServicesDiscovered, onCharacteristicChanged will trigger _connectionStatus or data LiveData updates,
-    // which in turn can update notification via the _connectionStatus observer)
+    // === GATT CALLBACK IMPLEMENTATION ===
+    
+    /**
+     * GATT callback to handle connection events, service discovery, and data reception
+     * All status changes automatically update the foreground notification
+     */
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
             val deviceAddress = gatt?.device?.address
@@ -670,8 +744,11 @@ class BleService : Service() {
             }
         }
 
+        /**
+         * Handle service discovery completion
+         * Sets up notification queue for all sensor characteristics
+         */
         override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
-            // (Original logic - _connectionStatus changes will update notification)
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 val address = gatt?.device?.address
                 Log.i(TAG, "onServicesDiscovered: Services discovered successfully for $address")
@@ -685,6 +762,8 @@ class BleService : Service() {
                     return
                 }
 
+                // === NOTIFICATION QUEUE SETUP ===
+                // Queue all sensor characteristics for notification enabling
                 Log.d(TAG, "onServicesDiscovered: Queueing characteristics for notifications...")
                 notificationQueue.clear()
                 isProcessingQueue = false
@@ -737,28 +816,21 @@ class BleService : Service() {
         }
 
 
+        /**
+         * Handle incoming sensor data from BLE characteristics
+         * Parses binary data and updates corresponding LiveData streams
+         */
         override fun onCharacteristicChanged(
-            gatt: BluetoothGatt, // Use this signature (gatt is non-null here)
+            gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
-            value: ByteArray // Use this signature available from API 33+, or the deprecated one for older
+            value: ByteArray
         ) {
-            // Fallback for older Android versions might be needed if you use the deprecated onCharacteristicChanged
-            // This signature is for Android 13 (API 33) and above.
-            // If targeting lower, ensure your gattCallback's onCharacteristicChanged matches the framework's.
-            // The framework calls the correct one based on API level.
-            // For compatibility, it's often easier to use the deprecated version:
-            // override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic)
-            // and then access characteristic.value
-            // Let's assume the `value` parameter is correctly populated.
-
             val uuid = characteristic.uuid
-            // val hexString = value.joinToString("") { "%02X".format(it) }
-            // Log.d(TAG, "onCharacteristicChanged UUID: $uuid, Size: ${value.size}, Raw Hex: $hexString, Value: ${characteristic.value.contentToString()}")
-
-            // Use characteristic.value if the 'value' param isn't working as expected or for wider compatibility
-            val currentBytes = characteristic.value ?: value // Prefer characteristic.value if robust
+            val currentBytes = characteristic.value ?: value
 
             try {
+                // === SENSOR DATA PARSING ===
+                // Parse binary sensor data based on characteristic UUID
                 when (uuid) {
                     SPEED_CHARACTERISTIC_UUID -> {
                         if (currentBytes.size == 4) {
@@ -822,7 +894,12 @@ class BleService : Service() {
         }
     }
 
-    // --- Helper Function to Enable Notifications (Queue-based) --- (Original - Unchanged)
+    // === NOTIFICATION QUEUE PROCESSING ===
+    
+    /**
+     * Process the notification queue to enable notifications on characteristics
+     * Uses sequential processing to avoid GATT operation conflicts
+     */
     private fun processNotificationQueue() {
         val gatt = bluetoothGatt
         if (gatt == null) {
@@ -923,7 +1000,12 @@ class BleService : Service() {
         }
     }
 
-    // --- Add new function to zero the accelerometer --- (Original - Unchanged)
+    // === ACCELEROMETER CALIBRATION ===
+    
+    /**
+     * Send zero/calibration command to the accelerometer
+     * @return true if write command was initiated successfully
+     */
     fun zeroAccelerometer(): Boolean {
         val gatt = bluetoothGatt ?: run {
             Log.e(TAG, "zeroAccelerometer: Not connected")

@@ -1,3 +1,38 @@
+/*
+ * SensorsFragment.kt - Sensor Data Display and Recording Interface
+ * 
+ * This fragment provides real-time sensor data visualization, data recording
+ * capabilities, and machine learning inference integration. It serves as the
+ * primary interface for monitoring bike sensor data and collecting training data.
+ * 
+ * Key Features:
+ * - Real-time sensor data display (speed, orientation, g-force, events)
+ * - Data recording with configurable duration and countdown
+ * - File management for recorded sensor data
+ * - Machine learning inference integration via InferenceService
+ * - Storage Access Framework support for Android 10+
+ * - Permission handling for storage access
+ * - Audio feedback during recording countdown
+ * 
+ * Data Recording:
+ * - Configurable recording duration (0.1s to 10s increments)
+ * - 10-second countdown with audio cues
+ * - CSV format data export with timestamps
+ * - Automatic file naming with collision avoidance
+ * - Support for both legacy and SAF storage methods
+ * 
+ * Machine Learning Integration:
+ * - Real-time inference buffer monitoring
+ * - Manual inference triggering
+ * - Class name display and result visualization
+ * - Integration with FMOD event parameter control
+ * 
+ * Architecture:
+ * - Observes BleService for sensor data
+ * - Integrates with InferenceService for ML processing
+ * - Uses Storage Access Framework for file operations
+ * - Handles Android permission requirements across versions
+ */
 package com.app.musicbike.ui.fragments
 
 import android.media.MediaPlayer
@@ -54,6 +89,12 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 
 import android.os.Build
 
+/**
+ * SensorsFragment - Real-time sensor monitoring and data recording interface
+ * 
+ * Provides comprehensive sensor data visualization, recording capabilities,
+ * and machine learning inference integration for the Music Bike system.
+ */
 class SensorsFragment : Fragment() {
 
     private val TAG = "SensorsFragment"
@@ -63,36 +104,44 @@ class SensorsFragment : Fragment() {
     private var bleService: BleService? = null
     private var hasAttemptedObservationSetup = false
 
-    // InferenceService integration
+    // === INFERENCE SERVICE INTEGRATION ===
     private var inferenceService: InferenceService? = null
     private var inferenceServiceBound = false
     private val updateStatusHandler = Handler(Looper.getMainLooper())
+    
+    /**
+     * Runnable for periodic inference status updates
+     * Updates UI with buffer status and model readiness every second
+     */
     private val statusUpdateRunnable = object : Runnable {
         override fun run() {
             updateInferenceStatus()
-            updateStatusHandler.postDelayed(this, 1000) // Update every second
+            updateStatusHandler.postDelayed(this, 1000)
         }
     }
 
-    // Recording support
+    // === DATA RECORDING STATE ===
     private var isRecording = false
     private var recordDurationSec = 0.0f
     private val recordBuffer = mutableListOf<String>()
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Countdown and sound support
+    // === COUNTDOWN AND AUDIO FEEDBACK ===
     private var countdownTimer: CountDownTimer? = null
     private var isCountingDown = false
     private var mediaPlayer: MediaPlayer? = null
 
-    // Used for machine learning file viewer
+    // === FILE MANAGEMENT ===
     private lateinit var fileAdapter: FileAdapter
 
-    // Storage Access Framework support
+    // === STORAGE ACCESS FRAMEWORK SUPPORT ===
     private lateinit var sharedPrefs: SharedPreferences
     private var selectedDirectoryUri: Uri? = null
 
-    // Activity result launcher for selecting directory
+    /**
+     * Activity result launcher for directory selection using Storage Access Framework
+     * Handles user directory selection for file storage on Android 10+
+     */
     private val selectDirectoryLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -107,7 +156,10 @@ class SensorsFragment : Fragment() {
         }
     }
 
-    // InferenceService connection
+    /**
+     * ServiceConnection for binding to InferenceService
+     * Manages ML inference service lifecycle and data flow
+     */
     private val inferenceServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             Log.d(TAG, "InferenceService connected")
@@ -162,7 +214,10 @@ class SensorsFragment : Fragment() {
 //    }
 
 
-    // Broadcast receiver for inference results
+    /**
+     * BroadcastReceiver for handling inference results from InferenceService
+     * Processes ML predictions and integrates with FMOD event system
+     */
     private val inferenceResultReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "com.app.musicbike.INFERENCE_RESULT") {
@@ -171,18 +226,17 @@ class SensorsFragment : Fragment() {
                     updateInferenceResult(it)
                     Log.d(TAG, "Received inference result: $it")
 
-                    // Extract the class name from the result string
+                    // === ML PREDICTION TO FMOD MAPPING ===
+                    // Extract class name and map to FMOD event parameter values
                     val className = it.substringAfter("Prediction: ").substringBefore(" (")
-
-                    // Map to FMOD event value
                     val eventValue = when (className) {
-                        "180t10n" -> 3f
-                        "HOPt10n" -> 1f
-                        "NoJpOr180t10n" -> 0f
+                        "180t10n" -> 3f        // 180-degree spin
+                        "HOPt10n" -> 1f        // Jump/hop
+                        "NoJpOr180t10n" -> 0f  // No event
                         else -> 0f
                     }
 
-                    // Only send if auto mode is on
+                    // Send to FMOD only if auto event mode is enabled
                     val musicService = (activity as? MainActivity)?.getMusicServiceInstance()
                     val musicViewModel = (activity as? MainActivity)?.musicViewModel
                     if (musicService != null && musicViewModel?.isEventAuto?.value == true) {
@@ -217,16 +271,16 @@ class SensorsFragment : Fragment() {
         sharedPrefs = PreferenceManager.getDefaultSharedPreferences(requireContext())
         loadSelectedDirectory()
 
-        // Initialize the slider (0..50 steps → 0.0..5.0s in 0.1s increments)
-        binding.seekRecordingDuration.max = 100 // Example: 100 * 0.1f = 10.0 seconds max
+        // === RECORDING DURATION SLIDER SETUP ===
+        // Configure slider for 0.1s to 10.0s recording duration
+        binding.seekRecordingDuration.max = 100 // 100 * 0.1f = 10.0 seconds max
         binding.seekRecordingDuration.progress = 0
         binding.txtDurationValue.text = "0.0"
 
-        // Add listener to update duration value
         binding.seekRecordingDuration.setOnSeekBarChangeListener(
             object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {
-                    recordDurationSec = progress * 0.1f // Adjust multiplier if max changes
+                    recordDurationSec = progress * 0.1f
                     binding.txtDurationValue.text =
                         String.format(Locale.US, "%.1f", recordDurationSec)
                 }
@@ -235,7 +289,7 @@ class SensorsFragment : Fragment() {
             }
         )
 
-        // Record button
+        // === RECORDING BUTTON SETUP ===
         binding.btnStartRecording.setOnClickListener {
             Log.d(TAG, "Start Recording button clicked")
             
@@ -275,7 +329,7 @@ class SensorsFragment : Fragment() {
             initiateRecordingSequence(filename)
         }
 
-        // Zero accelerometer button
+        // === ACCELEROMETER CALIBRATION BUTTON ===
         binding.btnZeroAccelerometer.setOnClickListener {
             if (bleService?.zeroAccelerometer() == true) {
                 Snackbar.make(binding.root, "Zeroing accelerometer...", Snackbar.LENGTH_SHORT).show()
@@ -284,7 +338,7 @@ class SensorsFragment : Fragment() {
             }
         }
 
-        // Inference trigger button
+        // === MANUAL INFERENCE TRIGGER BUTTON ===
         binding.btnTriggerInference.setOnClickListener {
             inferenceService?.triggerInference()
             Snackbar.make(binding.root, "Manual inference triggered", Snackbar.LENGTH_SHORT).show()
@@ -301,11 +355,14 @@ class SensorsFragment : Fragment() {
         setupInferenceService()
     }
 
+    /**
+     * Initialize and bind to InferenceService for machine learning functionality
+     * Sets up service connection and broadcast receiver for inference results
+     */
     private fun setupInferenceService() {
-        // Start and bind to InferenceService
         val serviceIntent = Intent(requireContext(), InferenceService::class.java)
         
-        // Use startForegroundService on Android 8.0+ (API 26+)
+        // Use appropriate service start method based on Android version
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             requireContext().startForegroundService(serviceIntent)
         } else {
@@ -314,7 +371,7 @@ class SensorsFragment : Fragment() {
         
         requireContext().bindService(serviceIntent, inferenceServiceConnection, Context.BIND_AUTO_CREATE)
         
-        // Register broadcast receiver for inference results
+        // Register for inference result broadcasts
         LocalBroadcastManager.getInstance(requireContext()).registerReceiver(
             inferenceResultReceiver,
             IntentFilter("com.app.musicbike.INFERENCE_RESULT")
@@ -395,16 +452,22 @@ class SensorsFragment : Fragment() {
         inferenceService?.addSensorData(pitchVal, rollVal, yawVal, gForceVal)
     }
 
+    /**
+     * Start the recording sequence with 10-second countdown and audio cues
+     * @param filename Base filename for the recording (without extension)
+     */
     private fun initiateRecordingSequence(filename: String) {
         isCountingDown = true
         binding.btnStartRecording.isEnabled = false
-        val countdownDurationMillis = 10000L // 10 seconds
-        val countDownIntervalMillis = 1000L  // 1 second
+        val countdownDurationMillis = 10000L
+        val countDownIntervalMillis = 1000L
 
         countdownTimer = object : CountDownTimer(countdownDurationMillis, countDownIntervalMillis) {
             override fun onTick(millisUntilFinished: Long) {
                 val secondsRemaining = millisUntilFinished / 1000
                 binding.btnStartRecording.text = "Starting in ${secondsRemaining}s..."
+                
+                // Play audio cues at specific countdown intervals
                 when (secondsRemaining.toInt()) {
                     5 -> playCountdownSound(2)
                     4 -> playCountdownSound(1)
@@ -415,11 +478,11 @@ class SensorsFragment : Fragment() {
             }
             override fun onFinish() {
                 isCountingDown = false
-                binding.btnStartRecording.text = "Starting..." // Brief intermediate state
+                binding.btnStartRecording.text = "Starting..."
                 startActualRecording(filename)
             }
         }
-        binding.btnStartRecording.text = "Starting in 10s..." // Initial text for countdown
+        binding.btnStartRecording.text = "Starting in 10s..."
         countdownTimer?.start()
     }
 
@@ -484,33 +547,42 @@ class SensorsFragment : Fragment() {
         // For frequent, short sounds, consider using SoundPool for lower latency.
     }
 
+    /**
+     * Begin actual sensor data recording after countdown completion
+     * @param filename Base filename for the CSV output file
+     */
     private fun startActualRecording(filename: String) {
-        if (recordDurationSec <= 0f) { // This check is now primarily in the click listener
+        if (recordDurationSec <= 0f) {
             Snackbar.make(binding.root, "Set a duration > 0", Snackbar.LENGTH_SHORT).show()
-            // Reset button if something went wrong before this point
             binding.btnStartRecording.text = "Start Recording"
             binding.btnStartRecording.isEnabled = true
-            isRecording = false // Ensure this is false if we bail out
+            isRecording = false
             isCountingDown = false
             return
         }
         recordBuffer.clear()
         isRecording = true
         binding.btnStartRecording.text = "Recording..."
-        binding.btnStartRecording.isEnabled = false // Should already be disabled, but ensure it
-        // Schedule stop
+        binding.btnStartRecording.isEnabled = false
+        
+        // Schedule automatic stop after configured duration
         mainHandler.postDelayed({
             stopRecording(filename)
         }, (recordDurationSec * 1000).toLong())
         Log.d(TAG, "Recording started for ${recordDurationSec}s. Saving to $filename.txt")
     }
 
+    /**
+     * Stop recording and save collected data to file
+     * Handles both Storage Access Framework and legacy file system methods
+     * @param filename Base filename for the output file
+     */
     private fun stopRecording(filename: String) {
         isRecording = false
         isCountingDown = false
         binding.btnStartRecording.text = "Start Recording"
         binding.btnStartRecording.isEnabled = true
-        countdownTimer?.cancel() // Cancel countdown if stop is called prematurely
+        countdownTimer?.cancel()
         
         if (recordBuffer.isEmpty() && recordDurationSec > 0) {
             Log.w(TAG, "Recording stopped, but buffer is empty. File will be empty or not created.")
@@ -534,7 +606,7 @@ class SensorsFragment : Fragment() {
                 Snackbar.LENGTH_LONG
             ).show()
         }
-        recordBuffer.clear() // Clear buffer after saving or attempting to save
+        recordBuffer.clear()
     }
     
     private fun saveFileUsingSAF(filename: String, data: ByteArray) {

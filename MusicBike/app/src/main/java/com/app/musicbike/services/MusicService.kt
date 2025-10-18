@@ -1,3 +1,25 @@
+/*
+ * MusicService.kt - FMOD Audio Playback Service
+ * 
+ * This foreground service manages real-time music playback using FMOD Studio.
+ * It integrates with BLE sensor data to dynamically control music parameters
+ * based on bike motion, events, and rider actions.
+ * 
+ * Key Features:
+ * - FMOD Studio integration for interactive audio
+ * - Real-time parameter control (speed, pitch, events, direction)
+ * - Automatic mode for BLE data integration
+ * - Manual mode for UI-driven parameter control
+ * - Ride statistics tracking and persistence
+ * - Foreground service for background operation
+ * - Integration with InferenceService for ML-based event detection
+ * 
+ * Architecture:
+ * - Binds to BleService for sensor data
+ * - Exposes LiveData for UI observation
+ * - Uses SharedPreferences for data persistence
+ * - Manages FMOD native library lifecycle
+ */
 package com.app.musicbike.services
 
 import android.app.Notification
@@ -22,15 +44,22 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.Observer
 import com.app.musicbike.R // Make sure R is imported correctly
 
+/**
+ * MusicService - Core audio playback and sensor integration service
+ * 
+ * Manages FMOD Studio audio engine and integrates real-time sensor data from BLE service.
+ * Runs as a foreground service to ensure continuous audio playback and data processing.
+ */
 class MusicService : Service() {
 
     private val TAG = "MusicService"
     private val binder = LocalBinder()
     private lateinit var notificationManager: NotificationManager
     private lateinit var prefs: SharedPreferences
-    private var isInferenceActive = false // Added flag
+    private var isInferenceActive = false // Flag to track InferenceService state
 
-    // --- FMOD Native Interface ---
+    // === FMOD NATIVE INTERFACE ===
+    // Native method declarations for FMOD Studio integration
     companion object {
         private const val NOTIFICATION_CHANNEL_ID = "MusicServiceChannel"
         private const val NOTIFICATION_CHANNEL_NAME = "Music Playback Service"
@@ -49,6 +78,10 @@ class MusicService : Service() {
         private const val KEY_DROP_COUNT = "dropCount"
         private const val KEY_180_COUNT = "oneEightyCount"
 
+        /**
+         * Static initialization block for FMOD native libraries
+         * Loads required FMOD libraries when the class is first accessed
+         */
         init {
             try {
                 Log.d("FMOD_MusicService", "Attempting to load FMOD libraries from MusicService...")
@@ -62,6 +95,7 @@ class MusicService : Service() {
         }
     }
 
+    // Native method declarations for FMOD Studio operations
     private external fun nativeStartFMODPlayback(masterBankPath: String, stringsBankPath: String)
     private external fun nativeSetFMODParameter(paramName: String, value: Float)
     private external fun nativeToggleFMODPlayback()
@@ -70,11 +104,17 @@ class MusicService : Service() {
     private external fun nativeStopFMODUpdateThread()
     private external fun nativeStopFMODPlayback()
 
-    // --- End FMOD Native Interface ---
+    // === END FMOD NATIVE INTERFACE ===
 
-    // --- BleService Connection ---
+    // === BLE SERVICE CONNECTION ===
+    // Connection management for BleService to receive sensor data
     private var bleService: BleService? = null
     private var bleServiceBound = false
+    
+    /**
+     * ServiceConnection for binding to BleService
+     * Handles connection lifecycle and sets up data observers
+     */
     private val bleServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             Log.d(TAG, "onServiceConnected: BleService connection established in MusicService.")
@@ -99,16 +139,18 @@ class MusicService : Service() {
             bleServiceBound = false
         }
     }
-    // --- End BleService Connection ---
+    // === END BLE SERVICE CONNECTION ===
 
-    // --- Auto Mode State Variables ---
+    // === AUTO MODE STATE VARIABLES ===
+    // Track which parameters are controlled automatically by BLE data vs manually by UI
     private var isSpeedInAutoMode = false
     private var isPitchInAutoMode = false
     private var isEventInAutoMode = false
     private var isHallDirectionInAutoMode = false
     private var isPitchSignalReversed = false
 
-    // --- LiveData for current FMOD parameter values (exposed to ViewModel) ---
+    // === LIVEDATA FOR UI OBSERVATION ===
+    // Current FMOD parameter values exposed to ViewModels and UI components
     private val _currentFmodSpeed = MutableLiveData<Float>(0.0f)
     val currentFmodSpeed: LiveData<Float> get() = _currentFmodSpeed
     // ... (other _currentFmod... LiveData)
@@ -119,7 +161,8 @@ class MusicService : Service() {
     private val _currentFmodHallDirection = MutableLiveData<Float>(1.0f)
     val currentFmodHallDirection: LiveData<Float> get() = _currentFmodHallDirection
 
-    // LiveData for RIDE STATS (to be observed by ViewModel)
+    // === RIDE STATISTICS LIVEDATA ===
+    // Real-time ride statistics tracked and persisted throughout the session
     private val _rideMaxSpeed = MutableLiveData<Float>(0f)
     val rideMaxSpeed: LiveData<Float> get() = _rideMaxSpeed
 
@@ -137,9 +180,9 @@ class MusicService : Service() {
 
     private val _ride180Count = MutableLiveData<Int>(0)
     val ride180Count: LiveData<Int> get() = _ride180Count
-    // --- END RIDE STATS LiveData ---
 
-    // Observers for BleService LiveData - UPDATED to also update stats
+    // === BLE DATA OBSERVERS ===
+    // These observers handle incoming sensor data and update both FMOD parameters and statistics
     private val speedObserver = Observer<Float> { speed ->
         updateMaxSpeedStat(speed) // Update stat
         if (isSpeedInAutoMode) {
@@ -157,6 +200,10 @@ class MusicService : Service() {
         }
     }
 
+    /**
+     * Observer for bike events (jumps, drops, 180° spins)
+     * Updates both statistics and FMOD event parameter in auto mode
+     */
     private val eventObserver = Observer<String> { event ->
         // Note: FMOD "Event" parameter is set when an event occurs.
         // Stat counting should happen based on the incoming 'event' string.
@@ -192,10 +239,19 @@ class MusicService : Service() {
         }
     }
 
+    /**
+     * Binder class for local service binding
+     * Allows other components to access MusicService instance
+     */
     inner class LocalBinder : Binder() {
         fun getService(): MusicService = this@MusicService
     }
 
+    // === SERVICE LIFECYCLE METHODS ===
+    
+    /**
+     * Service creation - Initialize FMOD, notifications, and BLE connection
+     */
     override fun onCreate() {
         super.onCreate()
         notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -220,9 +276,15 @@ class MusicService : Service() {
         bindService(bleServiceIntent, bleServiceConnection, Context.BIND_AUTO_CREATE)
     }
 
+    /**
+     * Handle service start commands and control InferenceService lifecycle
+     * @param intent Intent containing action commands for service control
+     * @return START_STICKY to keep service running
+     */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand: MusicService action: ${intent?.action}")
 
+        // Handle specific actions for InferenceService control
         when (intent?.action) {
             ACTION_START_INFERENCE -> {
                 if (!isInferenceActive) {
@@ -379,7 +441,12 @@ class MusicService : Service() {
         Log.d(TAG, "MusicService onDestroy completed.")
     }
 
-    // --- Public Control Methods ---
+    // === PUBLIC CONTROL METHODS ===
+    // Methods exposed to UI components for music playback control
+    
+    /**
+     * Start music playback if currently paused
+     */
     fun play() {
         Log.d(TAG, "play() called.")
         if (nativeIsFMODPaused()) {
@@ -388,6 +455,9 @@ class MusicService : Service() {
         updateNotification(if (isPlaying()) "Playing Music..." else "Playback Error")
     }
 
+    /**
+     * Pause music playback if currently playing
+     */
     fun pause() {
         Log.d(TAG, "pause() called.")
         if (!nativeIsFMODPaused()) {
@@ -396,18 +466,31 @@ class MusicService : Service() {
         updateNotification("Music Paused")
     }
 
+    /**
+     * Toggle between play and pause states
+     */
     fun togglePlayback() {
         Log.d(TAG, "togglePlayback() called.")
         togglePlaybackAndNotify()
         updateNotification(if (isPlaying()) "Playing Music..." else "Music Paused")
     }
 
+    /**
+     * Load FMOD bank files and initialize playback
+     * @param masterBankPath Path to the main FMOD bank file
+     * @param stringsBankPath Path to the strings bank file
+     */
     fun loadBank(masterBankPath: String, stringsBankPath: String) {
         Log.d(TAG, "loadBank() called with master: $masterBankPath, strings: $stringsBankPath")
         nativeStartFMODPlayback(masterBankPath, stringsBankPath)
         updateNotification("Bank Loaded: ${masterBankPath.substringAfterLast('/')}")
     }
 
+    /**
+     * Set an FMOD parameter value (public interface)
+     * @param name Parameter name (e.g., "Wheel Speed", "Pitch", "Event")
+     * @param value Parameter value to set
+     */
     fun setFmodParameter(name: String, value: Float) {
         Log.d(TAG, "setFmodParameter (public): $name to $value")
         setFmodParameterInternal(name, value)
@@ -433,7 +516,13 @@ class MusicService : Service() {
         return !isPaused
     }
 
-    // --- Public Methods to Control Auto Modes ---
+    // === AUTO MODE CONTROL METHODS ===
+    // Methods to enable/disable automatic parameter control from BLE data
+    
+    /**
+     * Enable or disable automatic speed parameter control
+     * @param enabled True to use BLE speed data, false for manual control
+     */
     fun setAutoSpeedMode(enabled: Boolean) {
         isSpeedInAutoMode = enabled
         Log.d(TAG, "Auto Speed Mode set to: $enabled")
@@ -446,6 +535,10 @@ class MusicService : Service() {
         }
     }
 
+    /**
+     * Enable or disable automatic pitch parameter control
+     * @param enabled True to use BLE pitch data, false for manual control
+     */
     fun setAutoPitchMode(enabled: Boolean) {
         isPitchInAutoMode = enabled
         Log.d(TAG, "Auto Pitch Mode set to: $enabled")
@@ -458,6 +551,10 @@ class MusicService : Service() {
         }
     }
 
+    /**
+     * Enable or disable automatic event parameter control
+     * @param enabled True to use BLE event data, false for manual control
+     */
     fun setAutoEventMode(enabled: Boolean) {
         isEventInAutoMode = enabled
         Log.d(TAG, "Auto Event Mode set to: $enabled")
@@ -490,7 +587,12 @@ class MusicService : Service() {
             }
         }
     }
-    // Stat Update, Persistence, and Reset Logic for MusicService
+    // === RIDE STATISTICS MANAGEMENT ===
+    // Methods for tracking, updating, and persisting ride statistics
+    
+    /**
+     * Update maximum speed statistic if current speed exceeds previous maximum
+     */
     private fun updateMaxSpeedStat(currentSpeed: Float) {
         val currentMax = _rideMaxSpeed.value ?: 0f
         if (currentSpeed > currentMax) {
@@ -538,6 +640,10 @@ class MusicService : Service() {
         Log.d(TAG, "180 count: $newCount")
     }
 
+    /**
+     * Reset all ride statistics to zero and clear persisted data
+     * Called when user wants to start a fresh riding session
+     */
     fun resetRideStats() {
         Log.i(TAG, "Resetting ride stats in MusicService.")
         _rideMaxSpeed.postValue(0f)

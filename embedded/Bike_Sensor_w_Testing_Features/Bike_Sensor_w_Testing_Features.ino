@@ -1,3 +1,7 @@
+// WARNING: THIS FILE IS DEPRECATED.
+// Bike_Sensor_Filtered_IMU.ino is the only up to date code for the embedded platform
+// This file is kept for reference only.
+
 // =============================================================================
 // HARDWARE ADJUSTMENT NOTES (As of 2025-05-04)
 // =============================================================================
@@ -53,10 +57,8 @@ float dropThreshold = 2.5;      // gForce check (> threshold spike for drop)
 
 // Rolling average size
 #define AVG_SIZE 50
-<<<<<<< HEAD
 #define THRESHOLD 5.0f
 =======
->>>>>>> a861e81841ea9b97ba73d500d7d647aa0828ff24
 
 //Define tunable ranges for potentiometers
 #define JUMP_THRESH_MIN 0.1f
